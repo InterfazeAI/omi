@@ -126,6 +126,18 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["memory", "facts", "notify memory"], section: .notifications, icon: "bell",
       settingId: "notifications.memory"),
     SettingsSearchItem(
+      name: "Integration Notifications",
+      subtitle: "Occasionally offer to connect an app Omi can use — Gmail, Notion, ChatGPT",
+      keywords: ["integration", "suggestions", "connect", "gmail", "notion", "nudge"],
+      section: .notifications, icon: "bell",
+      settingId: "notifications.integrationsuggestions"),
+    SettingsSearchItem(
+      name: "Reset Integration Suggestions",
+      subtitle: "Clear every integration's suggestion history so Omi can offer them again",
+      keywords: ["reset", "integration", "suggestions", "history", "again"],
+      section: .advanced, icon: "wrench.and.screwdriver",
+      settingId: "advanced.troubleshooting.resetintegrationsuggestions"),
+    SettingsSearchItem(
       name: "Daily Summary",
       subtitle: "Receive a daily summary of your conversations and activities",
       keywords: ["daily", "summary", "digest", "end of day"], section: .notifications, icon: "bell",
@@ -181,6 +193,12 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["upgrade", "buy", "pricing", "checkout", "architect", "operator", "unlimited"], section: .planUsage,
       icon: "creditcard", settingId: "planusage.purchase"),
 
+    // Referral
+    SettingsSearchItem(
+      name: "Refer a Friend", subtitle: "Share one free month of Omi Pro",
+      keywords: ["refer", "referral", "friend", "gift", "free month", "share link"],
+      section: .referral, icon: "gift", settingId: "referral.link"),
+
     // About
     SettingsSearchItem(
       name: "Software Updates", subtitle: "Check for and manage app updates",
@@ -196,8 +214,8 @@ struct SettingsSearchItem: Identifiable {
       keywords: ["auto install", "automatic install", "download updates", "install updates"],
       section: .about, icon: "info.circle", settingId: "about.autoinstall"),
     SettingsSearchItem(
-      name: "Update Channel", subtitle: "Choose between stable and beta update channels",
-      keywords: ["channel", "beta", "stable", "release channel"], section: .about,
+      name: "Omi Beta", subtitle: "Install the separate Omi Beta app beside this one",
+      keywords: ["channel", "beta", "stable", "release channel", "omi beta"], section: .about,
       icon: "info.circle", settingId: "about.channel"),
     SettingsSearchItem(
       name: "Version Info", subtitle: "Current app version and build number",
@@ -379,6 +397,7 @@ enum SettingsSidebarRoutes {
     .permissions,
     .shortcuts,
     .advanced,
+    .referral,
     .about,
   ]
 }
@@ -585,6 +604,7 @@ struct SettingsSidebarItem: View {
     case .floatingBar: return "sparkles"
     case .shortcuts: return "keyboard"
     case .advanced: return "chart.bar"
+    case .referral: return "gift"
     case .about: return "info.circle"
     case .permissions: return PermissionNavSymbol.outline
     }

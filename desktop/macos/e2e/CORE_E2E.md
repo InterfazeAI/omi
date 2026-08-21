@@ -76,8 +76,7 @@ Local full T0 (includes backend preflight + pytest desktop contracts):
 | Rust chat completions / API client | T0 + T1 |
 | Qualified-beta promotion | signed-artifact digest gate + T0 self-check + T2 + Fault |
 
-Automatic qualification runs this full row on the macOS release worker and fails closed unless its Docker runtime is
-healthy enough to boot the hermetic T2 stack. Stable nomination and production promotion remain manual operations.
+Local T2 and fault suites remain available as engineering QA tools. They do not gate Beta visibility. Stable nomination and production promotion remain manual operations.
 
 ## Flow audit baseline
 
@@ -123,7 +122,7 @@ healthy enough to boot the hermetic T2 stack. Stable nomination and production p
 | `subagent-row-benchmark` | v1 | typed bridge | 3 | Perf |
 | `apps` | v2 | manual `do:` | manual | Marketplace walker journey |
 | `audio-recording` | v2 | manual `do:` | manual | Needs mic permission |
-| `refer-external` | v2 | manual `do:` | manual | Profile menu → affiliate URL |
+| `refer-external` | v2 | manual `do:` | manual | Top bar + Settings → unique referral link |
 | `delete-account` | v2 | manual `do:` | manual | Confirmation sheet only; never confirm |
 | `logout` | v2 | manual bridge | manual | `sign_out` bridge action; local Auth emulator only |
 | `onboarding-smoke` | v2 | manual `do:` + bridge | manual | `reset_onboarding`; Wave 7 fix — manual until 2× local green |
@@ -147,7 +146,7 @@ healthy enough to boot the hermetic T2 stack. Stable nomination and production p
 | Plan / usage | T2 | bridge | read subscription | ✅ `plan-usage.yaml` |
 | Apps catalog | T2 + Live P2 | bridge + manual | catalog snapshot + walker | ✅ `apps-marketplace.yaml` / ⚠️ `apps.yaml` |
 | Connector import | T2 + Live P2 | bridge + manual | API probe + sheet UI | ✅ `connector-import.yaml` / ⚠️ `connector-import-progress.yaml` |
-| Refer external | Live P2 | manual | opens browser | ⚠️ `refer-external.yaml` |
+| Referrals | Live P2 | manual | copies unique link | ⚠️ `refer-external.yaml` |
 | Delete account | Live P2 | manual | confirm sheet only | ⚠️ `delete-account.yaml` |
 | Logout | Live P2 | manual bridge | `sign_out` action | ⚠️ `logout.yaml` (local emulator; stays manual — destructive to session) |
 | Onboarding reset | Live P2 | manual + bridge | reset + restart | ⚠️ `onboarding-smoke.yaml` (fix landed; manual gate) |

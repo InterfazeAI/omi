@@ -240,9 +240,6 @@ struct SettingsContentView: View {
   // Glow preview state
   @State var isPreviewRunning: Bool = false
 
-  // Downgrade confirmation alert
-  @State var showDowngradeAlert = false
-
   // Tier gating (0 = show all, 1-6 = sequential tiers)
   @AppStorage("currentTierLevel") var currentTierLevel = 0
 
@@ -362,6 +359,8 @@ struct SettingsContentView: View {
   @AppStorage("multiChatEnabled") var multiChatEnabled = false
   @AppStorage("conversationsCompactView") var conversationsCompactView = true
   @AppStorage("useLegacyHomeDesign") var useLegacyHomeDesign = false
+  @AppStorage("speakNotificationsAloud") var speakNotificationsAloud = false
+  @AppStorage(DefaultsKey.integrationNudgesEnabled.rawValue) var integrationNudgesEnabled = true
 
   // AI Chat settings
   @AppStorage("chatBridgeMode") var chatBridgeMode: String = "piMono"
@@ -405,6 +404,7 @@ struct SettingsContentView: View {
     case floatingBar = "Floating Bar"
     case shortcuts = "Shortcuts"
     case advanced = "Advanced"
+    case referral = "Refer a Friend"
     case about = "About"
     /// The established page that had no door. It was only ever written by the sidebar the glass
     /// shell stopped rendering, so `PermissionsPage` kept working with nothing on screen that
@@ -646,6 +646,8 @@ struct SettingsContentView: View {
           shortcutsSection
         case .advanced:
           advancedSection
+        case .referral:
+          referralSection
         case .about:
           aboutSection
         case .permissions:

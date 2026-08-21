@@ -95,6 +95,9 @@
         snapshot: expectedSnapshot,
         tasks: [
           ContextDirectorTaskContext(
+            // Matches the probe parser's synthetic fallback for a task supplied
+            // without an explicit id, so both sides of this golden agree.
+            id: "probe-0",
             description: "Review synthetic item",
             dueAt: try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-08-13T17:00:00Z")))
         ],
@@ -103,7 +106,11 @@
       XCTAssertEqual(captured?.operation, ModelQoS.Proactivity.reasoningOperation)
       XCTAssertEqual(captured?.prompt, expectedPrompt)
       XCTAssertNil(captured?.imageData)
-      XCTAssertEqual(captured?.cacheKey, "bucket:synthetic-bucket:v7")
+      // Constant, not bucket- or version-scoped: a key that changed on every
+      // published version fragmented the cache into entries that were written
+      // once and never read.
+      XCTAssertEqual(captured?.cacheKey, "director:v1")
+      XCTAssertEqual(captured?.cacheKey, ContextPromptCacheKey.director)
       XCTAssertEqual(captured?.maxCompletionTokens, 800)
       XCTAssertFalse(captured?.authorizationSnapshotWasPresent ?? true)
       XCTAssertEqual(captured?.schemaKeys, Set(["type", "properties", "required", "additionalProperties"]))
@@ -265,7 +272,7 @@
         descriptor?.params,
         [
           "bucket_id", "version", "header", "frozen", "tail", "validated_facts", "tasks", "app", "window",
-          "captured_at", "notify_worthiness",
+          "captured_at", "notify_worthiness", "visit_count",
         ])
     }
 

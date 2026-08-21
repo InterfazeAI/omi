@@ -471,11 +471,13 @@ extension APIClient {
     let id: String
     let status: String
     let discarded: Bool
+    let meetingTreatmentEligible: Bool
 
     enum CodingKeys: String, CodingKey {
       case id
       case status
       case discarded
+      case meetingTreatmentEligible = "meeting_treatment_eligible"
     }
 
     init(from decoder: Decoder) throws {
@@ -483,6 +485,7 @@ extension APIClient {
       id = try container.decode(String.self, forKey: .id)
       status = try container.decodeIfPresent(String.self, forKey: .status) ?? ConversationStatus.processing.rawValue
       discarded = try container.decodeIfPresent(Bool.self, forKey: .discarded) ?? false
+      meetingTreatmentEligible = try container.decodeIfPresent(Bool.self, forKey: .meetingTreatmentEligible) ?? false
     }
   }
 
@@ -843,6 +846,18 @@ extension APIClient {
     }
     let body = UpdateReadRequest(isRead: isRead, isDismissed: isDismissed)
     return try await patch("v3/memories/\(id)/read", body: body)
+  }
+
+  /// Records the owner's verdict on a memory.
+  ///
+  /// `keep: false` is the reject signal: the backend hides the memory from default
+  /// reads and drops it from the keyword index and knowledge graph. `value` is a
+  /// query parameter, not a body field — the route declares it as a bare scalar.
+  func reviewMemory(id: String, keep: Bool) async throws {
+    let _: MemoryStatusResponse = try await post(
+      "v3/memories/\(id)/review?value=\(keep)",
+      body: EmptyBody()
+    )
   }
 
   /// Marks all memories as read

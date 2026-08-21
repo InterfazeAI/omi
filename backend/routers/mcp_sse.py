@@ -7,7 +7,6 @@ allowing clients to connect without running a local MCP server.
 Implements the MCP 2025-03-26 Streamable HTTP Transport specification.
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -165,18 +164,17 @@ class MCPAuthContext:
     memory_context: Optional[ProductAuthorizationContext] = None
 
 
-def _mcp_memory_context_from_api_key_user_data(user_data: Dict[str, Any]) -> ProductAuthorizationContext:
+def _mcp_memory_context_from_auth_data(user_data: Dict[str, Any]) -> ProductAuthorizationContext:
     verified_auth = McpVerifiedAuth(
-        uid=user_data["user_id"],
-        app_id=user_data.get("app_id"),
-        key_id=user_data.get("key_id"),
+        uid=user_data.get("user_id") or user_data["uid"],
+        app_id=user_data.get("app_id") or user_data.get("client_id"),
+        key_id=user_data.get("key_id") or user_data.get("grant_id"),
         scopes=tuple(user_data.get("scopes") or ()),
     )
     return build_mcp_default_memory_read_context(verified_auth)
 
 
 def authenticate_api_key_auth_context(authorization: Optional[str]) -> Optional[ProductAuthorizationContext]:
-    """Validate an MCP API key and return its memory product auth context."""
     if not authorization:
         return None
 
@@ -194,7 +192,7 @@ def authenticate_api_key_auth_context(authorization: Optional[str]) -> Optional[
         return None
     enforce_account_deletion_http_access(user_data["user_id"])
     _enforce_mcp_cutover_access(user_data["user_id"])
-    return _mcp_memory_context_from_api_key_user_data(user_data)
+    return _mcp_memory_context_from_auth_data(user_data)
 
 
 def authenticate_mcp_request(authorization: Optional[str]) -> Optional[MCPAuthContext]:
@@ -220,7 +218,7 @@ def authenticate_mcp_request(authorization: Optional[str]) -> Optional[MCPAuthCo
             scopes=list(user_data.get("scopes") or MCP_LEGACY_API_KEY_SCOPES),
             app_id=user_data.get("app_id"),
             key_id=user_data.get("key_id"),
-            memory_context=_mcp_memory_context_from_api_key_user_data(user_data),
+            memory_context=_mcp_memory_context_from_auth_data(user_data),
         )
 
     oauth_context = mcp_oauth_db.validate_access_token(token, MCP_RESOURCE_URL)
@@ -235,6 +233,7 @@ def authenticate_mcp_request(authorization: Optional[str]) -> Optional[MCPAuthCo
         client_id=oauth_context.get("client_id"),
         resource=oauth_context.get("resource"),
         grant_id=oauth_context.get("grant_id"),
+        memory_context=_mcp_memory_context_from_auth_data(oauth_context),
     )
 
 
@@ -1803,44 +1802,30 @@ async def mcp_streamable_http(
 
 
 @router.get("/v1/mcp/sse", tags=["mcp"], response_class=Response)
-async def mcp_sse_get(
-    request: Request,
+def mcp_sse_get(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id"),
 ):
     """
-    SSE endpoint for server-initiated messages (optional).
+    GET on the Streamable HTTP endpoint: this server offers no server-initiated stream.
 
-    Clients can GET this endpoint to listen for server-initiated notifications.
-    This is optional per the MCP spec and mainly used for long-polling scenarios.
+    The two header parameters are accepted and ignored: released app-client OpenAPI
+    contracts describe them on this operation, and removing them reads as a breaking
+    request-shape change to the compatibility checker.
+
+    Per the MCP Streamable HTTP transport spec (2025-03-26), a server that does not
+    offer server-initiated messages MUST return 405 Method Not Allowed for GET, and
+    clients MUST NOT treat that as an error.
+
+    This used to return an infinite keepalive-ping SSE stream that carried no protocol
+    data (this transport is stateless; nothing is ever pushed, and the deprecated
+    HTTP+SSE transport's required ``endpoint`` event was never sent). Every connected
+    MCP client parked one such stream for the full Cloud Run request timeout (3600s),
+    which exhausted the service's concurrency slots while CPU sat idle and drove
+    tool-call tail latency to minutes ("no available instance" aborts). Do not
+    reintroduce a long-lived GET stream here without accounting for that capacity.
     """
-    # Authenticate
-    auth_context = await run_blocking(db_executor, authenticate_mcp_request, authorization)
-    if not auth_context:
-        raise invalid_mcp_auth_exception()
-
-    await run_blocking(critical_executor, check_rate_limit_inline, auth_context.uid, "mcp:sse")
-
-    # For backwards compatibility, also support the old SSE flow
-    # Return an empty SSE stream that just sends keepalives
-    async def event_generator():
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                yield f"event: ping\ndata: {{}}\n\n"
-                await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            # Normal cancellation when client disconnects
-            pass
-        except Exception as e:
-            logging.warning(f"MCP SSE event generator error: {e}")
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-    )
+    return Response(status_code=405, headers={"Allow": "POST, HEAD, DELETE"})
 
 
 @router.head("/v1/mcp/sse", tags=["mcp"], response_class=Response)

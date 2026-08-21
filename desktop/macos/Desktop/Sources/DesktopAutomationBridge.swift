@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import Network
 import OmiSupport
+import OmiTheme
 import VoiceTurnDomain
 
 enum DesktopAutomationLaunchOptions {
@@ -1703,11 +1704,22 @@ final class DesktopAutomationActionRegistry {
         ? "none"
         : containing.map { window in
           var extras = ""
+          let local = NSPoint(
+            x: cocoaPoint.x - window.frame.minX, y: cocoaPoint.y - window.frame.minY)
           if let bar = window as? FloatingControlBarWindow {
-            let local = NSPoint(
-              x: cocoaPoint.x - window.frame.minX, y: cocoaPoint.y - window.frame.minY)
             extras =
               " acceptsHit=\(bar.automationAcceptsMouseHit(inContentPoint: local)) ignores=\(window.ignoresMouseEvents)"
+          } else {
+            // Shell click-through verdict (ShellClickThrough.swift): whether this point owns the
+            // pointer, per the same policy the ignoresMouseEvents sync runs.
+            let accepts = ShellClickThroughPolicy.acceptsMouseHit(
+              localPoint: local,
+              windowSize: window.frame.size,
+              isResizable: window.styleMask.contains(.resizable),
+              contentContains: { InkGlassHitRegions.shared.containsPoint($0, in: window) })
+            extras =
+              " shellAccepts=\(accepts) glassSurfaces=\(InkGlassHitRegions.shared.surfaceCount(in: window))"
+              + " ignores=\(window.ignoresMouseEvents)"
           }
           return
             "\(String(describing: type(of: window)))(\"\(window.title)\" level=\(window.level.rawValue) key=\(window.isKeyWindow) idx=\(window.orderedIndex)\(extras))"
@@ -2394,6 +2406,31 @@ final class DesktopAutomationActionRegistry {
     }
 
     register(
+      name: "integration_nudge_evaluate",
+      summary:
+        "Read-only: which integration a given frontmost app/window maps to, and whether a nudge would fire",
+      params: ["bundle_id", "window_title"],
+      category: "read",
+      safety: "read_only"
+    ) { params in
+      await IntegrationNudgeAutomation.evaluate(
+        bundleID: params["bundle_id"],
+        windowTitle: params["window_title"]
+      )
+    }
+
+    register(
+      name: "integration_nudge_present",
+      summary: "Present the integration-connect card for one catalog entry (QA of the real card path)",
+      params: ["telemetry_id"],
+      category: "write",
+      surfaces: ["floating_bar"],
+      safety: "presents_ui"
+    ) { params in
+      await MainActor.run { IntegrationNudgeAutomation.present(telemetryID: params["telemetry_id"] ?? "") }
+    }
+
+    register(
       name: "cloud_connector_guidance_probe",
       summary: "Read-only diagnostic of the live Claude Add detection (no overlay, no clicks)"
     ) { _ in
@@ -3049,6 +3086,10 @@ final class DesktopAutomationActionRegistry {
       ]
     }
 
+    register(name: "permissions_snapshot", summary: "Every permission row the Permissions page shows") {
+      _ in await PermissionsSnapshot.capture()
+    }
+
     register(
       name: "create_test_folder",
       summary: "Create a hermetic conversation folder via the real API",
@@ -3405,49 +3446,7 @@ final class DesktopAutomationActionRegistry {
       ]
     }
 
-    register(
-      name: "settings_notifications_snapshot",
-      summary: "Return notification settings and local permission state"
-    ) { _ in
-      async let settingsTask = APIClient.shared.getNotificationSettings()
-      let settings = try await settingsTask
-      let appState = await MainActor.run { AppState.current }
-      let hasPermission = appState?.hasNotificationPermission ?? false
-      let bannersDisabled = appState?.isNotificationBannerDisabled ?? false
-      return [
-        "schema": "enabled,frequency,frequency_label,has_permission,banners_disabled",
-        "enabled": settings.enabled ? "true" : "false",
-        "frequency": "\(settings.frequency)",
-        "frequency_label": settings.frequencyDescription,
-        "has_permission": hasPermission ? "true" : "false",
-        "banners_disabled": bannersDisabled ? "true" : "false",
-      ]
-    }
-
-    register(
-      name: "set_notification_settings",
-      summary: "Update notification settings via the real API",
-      params: ["enabled", "frequency"]
-    ) { params in
-      let enabled = params["enabled"].map { boolParam($0, default: true) }
-      let frequency = params["frequency"].flatMap { Int($0) }
-      let response = try await APIClient.shared.updateNotificationSettings(
-        enabled: enabled,
-        frequency: frequency
-      )
-      UserDefaults.standard.set(
-        response.enabled,
-        forKey: NotificationService.masterEnabledDefaultsKey)
-      UserDefaults.standard.set(
-        response.frequency,
-        forKey: NotificationService.frequencyDefaultsKey)
-      return [
-        "saved": "true",
-        "enabled": response.enabled ? "true" : "false",
-        "frequency": "\(response.frequency)",
-      ]
-    }
-
+    registerNotificationActions()
     register(
       name: "rewind_settings_snapshot",
       summary: "Return Rewind settings retention and excluded-app counts"
@@ -3794,7 +3793,7 @@ final class DesktopAutomationActionRegistry {
 }
 
 /// Coerce a string param ("true"/"1"/"yes") into a Bool, falling back when absent.
-private func boolParam(_ raw: String?, default fallback: Bool) -> Bool {
+func boolParam(_ raw: String?, default fallback: Bool) -> Bool {
   guard let raw = raw?.trimmingCharacters(in: .whitespaces).lowercased(), !raw.isEmpty else {
     return fallback
   }

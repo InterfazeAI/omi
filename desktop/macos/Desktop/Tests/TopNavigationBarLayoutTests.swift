@@ -236,6 +236,17 @@ final class TopNavigationBarLayoutTests: XCTestCase {
     )
   }
 
+  func testReferAFriendSitsImmediatelyAfterAdvancedInSettings() {
+    guard
+      let advanced = SettingsSidebarRoutes.visibleSections.firstIndex(of: .advanced),
+      let referral = SettingsSidebarRoutes.visibleSections.firstIndex(of: .referral)
+    else {
+      return XCTFail("Advanced and Refer a Friend must both be visible Settings rows")
+    }
+
+    XCTAssertEqual(referral, advanced + 1)
+  }
+
   /// A destination whose `reach` points at a page the bar does not have a pill for is exactly the
   /// stranding INV-NAV-1 forbids, so the checker has to *see* it rather than pass vacuously.
   func testTheReachabilityCheckerCatchesADestinationWhosePillWasRemoved() {
@@ -353,11 +364,14 @@ final class TopNavigationBarLayoutTests: XCTestCase {
       rootView: TopNavigationBarLayout(
         expandedNavigation: {
           TopNavigationLayoutProbe(recorder: recorder, slot: .expanded) {
-            TopNavigationDestinationRow(
-              selectedIndex: SidebarNavItem.dashboard.rawValue,
-              badges: TopNavigationDestinationBadges(library: 99, tasks: 99),
-              onSelect: { _ in }
-            )
+            HStack(spacing: TopNavigationPillMetrics.itemSpacing) {
+              TopNavigationDestinationRow(
+                selectedIndex: SidebarNavItem.dashboard.rawValue,
+                badges: TopNavigationDestinationBadges(library: 99, tasks: 99),
+                onSelect: { _ in }
+              )
+              ReferralTopBarButton {}
+            }
           }
         },
         compactNavigation: {
@@ -396,7 +410,7 @@ final class TopNavigationBarLayoutTests: XCTestCase {
     // horizontal padding on both sides plus the fixed icon column, and the gaps are `itemSpacing`.
     // Real pills are wider than that — they carry a word, and two carry a badge — so this is a strict
     // lower bound that still fails the moment a pill stops being rendered.
-    let pills = CGFloat(TopNavigationRoutes.primaryItems.count)
+    let pills = CGFloat(TopNavigationRoutes.primaryItems.count + 1)
     let minimumPillWidth =
       TopNavigationPillMetrics.horizontalPadding * 2 + TopNavigationPillMetrics.iconWidth
     let floor = pills * minimumPillWidth + (pills - 1) * TopNavigationPillMetrics.itemSpacing
@@ -410,9 +424,14 @@ final class TopNavigationBarLayoutTests: XCTestCase {
   }
 
   func testNavigationLaneMatchesFullChatWidthAndPageInsets() {
-    XCTAssertEqual(TopNavigationLayoutMetrics.contentLaneWidth(for: 1_400), 900)
-    XCTAssertEqual(TopNavigationLayoutMetrics.contentLaneWidth(for: 800), 768)
-    XCTAssertEqual(TopNavigationLayoutMetrics.contentLaneWidth(for: 40), 8)
+    // The 900 pt readable cap lives on the window, not inside the lane. The glass fills
+    // the window horizontally — including a hypothetical 1400 pt host that bypassed the max.
+    XCTAssertEqual(
+      TopNavigationLayoutMetrics.contentLaneWidth(for: DesktopWindowLayoutPolicy.maximumContentWidth),
+      ChatComposerLayout.contentLaneMaxWidth)
+    XCTAssertEqual(TopNavigationLayoutMetrics.contentLaneWidth(for: 1_400), 1_400)
+    XCTAssertEqual(TopNavigationLayoutMetrics.contentLaneWidth(for: 800), 800)
+    XCTAssertEqual(TopNavigationLayoutMetrics.contentLaneWidth(for: 40), 40)
   }
 
   /// The bar's *glass* is the lane and its controls are inset inside it — so the inset has to leave a

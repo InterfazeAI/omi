@@ -437,7 +437,7 @@ struct DesktopHomeView: View {
       enforceMainWindowMinimumSize()
       reportAutomationState()
       // First-run seed so the counter doesn't count the entire backlog as "new".
-      if topBarNewSinceRaw.isZero { topBarNewSinceRaw = Date().timeIntervalSince1970 }
+      seedTopBarNewSinceIfNeeded()
     }
     .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
       reportAutomationState()
@@ -483,41 +483,25 @@ struct DesktopHomeView: View {
   }
 
   private func enforceMainWindowMinimumSize() {
-    let minimumContentSize = DesktopWindowLayoutPolicy.minimumContentSize
     DispatchQueue.main.async {
       // Appearance belongs to `WindowGlass.wear(_:as:)`; stamping one here unpinned the glass.
       for window in NSApp.windows where window.title.lowercased().hasPrefix("omi") {
-        window.contentMinSize = minimumContentSize
-        window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: minimumContentSize)).size
-
-        let currentContentSize = window.contentView?.bounds.size ?? window.contentLayoutRect.size
-        let widthDelta = max(0, minimumContentSize.width - currentContentSize.width)
-        let heightDelta = max(0, minimumContentSize.height - currentContentSize.height)
-        if widthDelta > 0 || heightDelta > 0 {
-          var frame = window.frame
-          frame.size.width += widthDelta
-          frame.size.height += heightDelta
-          frame.origin.y -= heightDelta
-          window.setFrame(frame, display: true, animate: false)
-        }
-
-        // Remove .minSize from hosting view's sizingOptions.
-        // Search contentView itself + all descendants.
+        Self.pinShellWindowSizeLimits(window)
         Self.disableMinSizeComputation(in: window)
       }
     }
   }
 
-  /// Re-pin the window minimum on every live resize. SwiftUI's `.automatic` window
+  /// Re-pin the window min and max on every live resize. SwiftUI's `.automatic` window
   /// resizability periodically recomputes content-size extrema and overwrites the
   /// one-shot pin from `enforceMainWindowMinimumSize()`, after which the window can be
-  /// dragged small enough to hide content. Observing `didResize` and re-pinning keeps
-  /// AppKit clamping the live drag at the minimum. Installed once for the app's lifetime.
+  /// dragged small enough to hide content or wide enough to recreate the invisible
+  /// click border. Observing `didResize` and re-pinning keeps AppKit clamping the live
+  /// drag. Installed once for the app's lifetime.
   private static var minimumSizeGuardInstalled = false
   private func installMinimumSizeGuardIfNeeded() {
     guard !Self.minimumSizeGuardInstalled else { return }
     Self.minimumSizeGuardInstalled = true
-    let minimumContentSize = DesktopWindowLayoutPolicy.minimumContentSize
     NotificationCenter.default.addObserver(
       forName: NSWindow.didResizeNotification, object: nil, queue: .main
     ) { notification in
@@ -526,12 +510,48 @@ struct DesktopHomeView: View {
         guard let window = objectBox.value as? NSWindow,
           window.title.lowercased().hasPrefix("omi")
         else { return }
-        let frameMin = window.frameRect(
-          forContentRect: NSRect(origin: .zero, size: minimumContentSize)
-        ).size
-        if window.contentMinSize != minimumContentSize { window.contentMinSize = minimumContentSize }
-        if window.minSize != frameMin { window.minSize = frameMin }
+        Self.pinShellWindowSizeLimits(window, resizeFrame: false)
       }
+    }
+  }
+
+  /// Pins the hugged glass: not smaller than the destinations, not wider than the
+  /// readable lane plus its page margins. Height stays display-limited.
+  private static func pinShellWindowSizeLimits(_ window: NSWindow, resizeFrame: Bool = true) {
+    let minimumContentSize = DesktopWindowLayoutPolicy.minimumContentSize
+    let maximumContentSize = NSSize(
+      width: DesktopWindowLayoutPolicy.maximumContentWidth,
+      height: 10_000)
+    window.contentMinSize = minimumContentSize
+    window.minSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: minimumContentSize)).size
+    window.contentMaxSize = maximumContentSize
+    window.maxSize = window.frameRect(forContentRect: NSRect(origin: .zero, size: maximumContentSize)).size
+
+    guard resizeFrame else { return }
+    let currentContentSize = window.contentView?.bounds.size ?? window.contentLayoutRect.size
+    var frame = window.frame
+    var changed = false
+    let widthDelta = max(0, minimumContentSize.width - currentContentSize.width)
+    let heightDelta = max(0, minimumContentSize.height - currentContentSize.height)
+    if widthDelta > 0 || heightDelta > 0 {
+      frame.size.width += widthDelta
+      frame.size.height += heightDelta
+      frame.origin.y -= heightDelta
+      changed = true
+    }
+    let maxFrameWidth = window.frameRect(
+      forContentRect: NSRect(
+        origin: .zero,
+        size: NSSize(width: maximumContentSize.width, height: currentContentSize.height))
+    ).width
+    if frame.size.width > maxFrameWidth {
+      let extra = frame.size.width - maxFrameWidth
+      frame.origin.x += extra / 2
+      frame.size.width = maxFrameWidth
+      changed = true
+    }
+    if changed {
+      window.setFrame(frame, display: true, animate: false)
     }
   }
 
@@ -612,6 +632,12 @@ struct DesktopHomeView: View {
   /// Reference instant for the top bar's "new since you were last here" counts.
   private var topBarSinceDate: Date {
     topBarNewSinceRaw > 0 ? Date(timeIntervalSince1970: topBarNewSinceRaw) : Date()
+  }
+
+  private func seedTopBarNewSinceIfNeeded() {
+    let currentValue = topBarNewSinceRaw
+    guard currentValue == 0 else { return }
+    topBarNewSinceRaw = Date().timeIntervalSince1970
   }
 
   private var currentAppStateLabel: String {
@@ -1361,7 +1387,7 @@ struct DesktopHomeView: View {
       }
     }
     .onEscapeKey(priority: .navigation) { navigateHomeOnEscapeIfNeeded() }
-    // The hidden title bar puts the traffic lights over the content view.
+    // The top bar occupies the hidden title-bar band; the window's top edge is the glass.
     .padding(.top, GlassShell.titlebarClearance)
   }
 

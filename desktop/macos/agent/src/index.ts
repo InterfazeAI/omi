@@ -1554,6 +1554,12 @@ async function main(): Promise<void> {
   registry.register("acp", () => acpAdapter, 1);
   const artifactStorage = new OmiArtifactStorage({ rootDir: agentArtifactsDir() });
   logErr(`Omi artifact root: ${artifactStorage.rootDir}`);
+  const prunedToolOutputs = artifactStorage.pruneExpiredToolOutputs();
+  if (prunedToolOutputs.deletedFiles > 0) {
+    logErr(
+      `Pruned ${prunedToolOutputs.deletedFiles} expired tool-output files (${prunedToolOutputs.freedBytes} bytes)`,
+    );
+  }
   const recoverRunInput = (adapterId: string) => {
     if (adapterId !== "acp") return {};
     return {
@@ -1921,7 +1927,9 @@ async function main(): Promise<void> {
             await startAcpProcess();
             await initializeAcp();
           } else if (adapterId === "pi-mono") {
-            await ensurePiMonoAdapter(process.env.OMI_AUTH_TOKEN);
+            if (!(await ensurePiMonoAdapter(process.env.OMI_AUTH_TOKEN))) {
+              throw new Error(adapterActivationError("pi-mono"));
+            }
           } else if (adapterId === "hermes") {
             if (!(await ensureHermesAdapter())) {
               throw new Error(adapterActivationError("hermes"));
