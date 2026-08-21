@@ -54,28 +54,48 @@ If you don't receive code `100` or `200`, the command was not completed.
 ## Testing Process
 
 <Info>
-**Prerequisites:** Python packages from `requirements.txt`, plus `ffmpeg` and `opus` for audio decoding. The test scripts live in [`omi/firmware/scripts/devkit/`](https://github.com/BasedHardware/omi/tree/main/omi/firmware/scripts/devkit).
+**Prerequisites:** Python packages from `requirements.txt`, plus `opus` for audio decoding (`brew install opus` on macOS). The tools live in [`omi/firmware/scripts/devkit/sd_sync/`](https://github.com/BasedHardware/omi/tree/main/omi/firmware/scripts/devkit/sd_sync). Run them from that directory — they import `omi_sd` as a sibling module.
 </Info>
 
-Run these scripts in order:
+These find the device by service UUID, so there is no device ID to paste in.
 
 <Steps>
-  <Step title="Discover Devices" icon="bluetooth">
-    Run `discover_devices.py` to list all nearby Bluetooth devices. Look for **"Omi"** or **"Omi Devkit 2"** and note the device ID.
+  <Step title="Check what is on the card" icon="list">
+    ```bash
+    python3 info.py
+    ```
+    Prints the device name, how many bytes are recorded, and roughly how long a full sync would take. If nothing is found, the device is not advertising — see the note below.
   </Step>
-  <Step title="Check File Sizes" icon="list">
-    Run `get_info_list.py` — replace the `device_id` value with your device ID. This lists the size of each audio file on the SD card.
+  <Step title="Record and download" icon="download">
+    ```bash
+    python3 record_and_pull.py 60 ~/Desktop/take1.wav
+    ```
+    Marks the current recording length, waits 60 seconds while you speak near the mic, then downloads exactly that span and decodes it to a playable WAV. Recording continues throughout and the card is not cleared.
   </Step>
-  <Step title="Download Audio" icon="download">
-    Run `get_audio_file.py` — replace the `device_id` value with your device ID. Audio data streams to `my_file.txt` in the current directory.
+  <Step title="Re-decode an earlier span" icon="file-audio">
+    ```bash
+    python3 pull_range.py <start> <length> ~/Desktop/take2.wav
+    ```
+    Audio stays on the card until it is overwritten, so you can pull a span again without recording it again.
   </Step>
-  <Step title="Decode Audio" icon="file-audio">
-    Run `decode_audio.py` to convert the downloaded data into a WAV file. If successful, you'll have a playable recording of what was spoken near the mic.
+  <Step title="(Optional) Check sync speed" icon="gauge">
+    ```bash
+    python3 throughput.py 25
+    ```
+    Roughly 14–16 KB/s is healthy. Around 0.1 KB/s indicates thread starvation in the firmware rather than a slow card.
   </Step>
   <Step title="(Optional) Delete Audio" icon="trash">
-    Run `delete_audio_files.py` — replace the `device_id` value with your device ID. This clears audio data from the specified file.
+    Run `delete_audio_files.py` from the parent directory — replace the `device_id` value with your device ID. Prefer reading from an offset over deleting: on some firmware revisions the delete command stopped recording until the next reboot.
   </Step>
 </Steps>
+
+<Note>
+The device only starts advertising after its SD card mounts successfully, so "device not found" usually points at the card rather than the radio.
+</Note>
+
+<Warning>
+The older scripts in the parent directory — `get_audio_file.py` and `decode_audio.py` — target a previous storage protocol that used 83-byte packets, and fail silently against current firmware, which sends 440-byte blocks. One writes an empty file, the other decodes garbage, and neither reports an error. Use the `sd_sync/` tools above.
+</Warning>
 
 ---
 

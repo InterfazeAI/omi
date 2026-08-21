@@ -23,6 +23,9 @@ brew install opus          # macOS; the decoder loads libopus directly
 Run from this directory (the scripts import `omi_sd` as a sibling).
 
 ```bash
+# What is on the card, and how long a full sync would take
+python3 info.py
+
 # Record while you speak, then pull back exactly that span
 python3 record_and_pull.py 60 ~/Desktop/take1.wav
 

@@ -188,21 +188,54 @@ deleting during testing.
 ## Host Tools
 
 `../scripts/devkit/sd_sync/` implements all of the above — discovery, download, the resyncing
-parser and decode to WAV. Use these rather than the older scripts one level up, which hardcode
-a device ID and assume block alignment.
+parser and decode to WAV. Run them from that directory, since they import `omi_sd` as a sibling.
 
 ```bash
+python3 info.py                                     # size on card, estimated sync time
 python3 record_and_pull.py 60 ~/Desktop/take1.wav   # record a window, pull it back
 python3 pull_range.py <start> <length> [out.wav]    # re-decode a span already on the card
 python3 throughput.py 25                            # sync speed; ~14-16 KB/s is healthy
 ```
 
+**The older scripts one level up do not work against this firmware, and fail quietly.** They
+were written for a previous storage protocol that notified 83-byte packets carrying a 4-byte
+header, with frame length at offset 3. This firmware sends the 440-byte blocks described above,
+whose framing is `[length][payload]` with no header. Concretely:
+
+- `sdcard_test_files/get_audio_file.py` only writes packets matching `len(data) == 83`, so it
+  discards every notification and leaves `my_file.txt` empty — with no error printed.
+- `get_audio_file.py` does save the raw blocks, but its frame extraction reads the old header
+  offsets, so `audio_frames` is nonsense.
+- Both copies of `decode_audio.py` walk the file in a fixed 83-byte stride and take length from
+  offset 3. Against 440-byte blocks that yields garbage rather than a clean failure.
+- Both hardcode `device_id` to a CoreBluetooth UUID specific to one Mac and one device, and
+  always read from offset 0.
+
+`MAX_WRITE_SIZE 440` dates to the first commit of `transport.c`, so these scripts have been
+stale for a long time. `docs/doc/developer/DevKit2Testing.mdx` still instructs readers to run
+them.
+
 ## Still Open
 
-- The stray length byte and shiftable block grid make the on-card format fragile. It works only
-  because the decoder resynchronizes. Worth fixing in the storage format itself.
+- Each 440-byte block ends in ~12.6 bytes of stale data (measured: one contiguous garbage run
+  per block, 3.0% of the stream, and consecutive runs are the same bytes shifted by one or two —
+  leftovers from the previous block, since `write_to_storage()` only overwrites the front of
+  `storage_temp_data`). **Not worth changing.** Both app consumers already stop at the boundary
+  (`storage_sync.dart` and `ring_protocol.dart` break on `offset + 1 + size >= 440`, which
+  exactly matches the firmware's overflow rule), so nothing mis-parses it. Zero-filling the tail
+  would not reclaim the space either; that would need frames to span blocks, which breaks the
+  "each block parses independently" contract both paths rely on.
 - The Zephyr `card_ioctl` fall-through is worked around, not fixed upstream.
+- **A genuinely failing card is currently indistinguishable from that SDK bug.** Because
+  `storage_sync_locked()` swallows every `fs_sync` error, `sync_error_count` (`sdcard.c`) is the
+  only signal that could tell a real fault from the known false one — and nothing reads it.
+  Deliberately accepted; log it periodically if card faults are ever suspected.
+- Dead code in `transport.c`: the file-scope `static uint32_t offset` is never read or written,
+  and the init `memset(storage_temp_data, 0, OPUS_PADDED_LENGTH * 4)` clears 320 bytes of a
+  440-byte buffer. Harmless (statics are zero-initialized) but it reads like tail-clearing that
+  does not happen — see the first bullet before concluding the tail is meant to be cleared.
 - Mic gain is `MIC_GAIN 64` (+12 dB; register step is 0.5 dB from 40 = 0 dB). Test recordings
-  clip at 0.0 dBFS on close speech. Level does not meaningfully affect file size — a 14 dB
-  louder take changed the data rate by 0.6% — so lowering it to ~52 (+6 dB) costs no capacity.
+  clip at 0.0 dBFS on close speech, which is permanent distortion. Level does not meaningfully
+  affect file size — a 14 dB louder take changed the data rate by 0.6% — so lowering it to ~52
+  (+6 dB) would cost no capacity. Kept at 64 by choice.
 - 32 kbps was judged clearly better on soft sounds than the 20 kbps currently configured.
