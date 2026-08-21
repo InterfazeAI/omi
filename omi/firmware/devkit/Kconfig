@@ -19,6 +19,24 @@ config OMI_ENABLE_OFFLINE_STORAGE
         "Enable the offline storage support. Requires a SD Card."
 	default n
 
+config OMI_RING_SEGMENT_COUNT
+    int "Recording segments to keep before overwriting the oldest"
+    default 128
+    range 2 200
+    help
+        "How many segment files the recording ring holds. Eviction drops a whole segment, so
+        this sets how coarse the loss is: at 128 you lose under 1% of retained audio at a
+        time. Capped at 200 because the segment number is a byte on the wire."
+
+config OMI_RING_SEGMENT_BYTES
+    int "Fixed segment size in bytes (0 = derive from free space)"
+    default 0
+    help
+        "Leave at 0 in production: the segment size is then derived from the card's free
+        space at mount, so the same image suits a 4 GB and a 64 GB card. Set it to force a
+        size, which is how rotation and eviction get exercised in minutes rather than days.
+        Rounded down to a multiple of 450560 (lcm of the write batch and the 440-byte block)."
+
 config OMI_ENABLE_ACCELEROMETER
     bool "Accelerometer Support"
     help

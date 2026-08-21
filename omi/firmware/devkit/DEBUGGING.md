@@ -55,6 +55,21 @@ genuine upstream bug and worth reporting.
 
 *Do not re-diagnose this by reformatting the card. It is not the card.*
 
+**It is not only `fs_sync`.** Every FatFs call that ends in a flush hits the same ioctl, so
+`fs_unlink` and `fs_rename` also return `-EIO` *after doing the work*. This cost a full session:
+ring eviction reported failure on every rotation, the loop bailed out to avoid leaking a file it
+believed was still there, and the segment count grew without bound — while each unlink had in
+fact deleted the file. The giveaway was that the oldest sequence number advanced by exactly one
+per reboot.
+
+Never branch on the return code of these calls. `path_absent_locked()` in `sdcard.c` asks the
+filesystem what actually happened instead:
+
+```c
+int rc = fs_unlink(path);
+if (rc && !path_absent_locked(path)) { /* only now is it a real failure */ }
+```
+
 ### 2. Small writes are pathologically slow — batch them
 
 A 440-byte write lands inside a single 512-byte sector, so the card erases and reprograms a
@@ -106,7 +121,69 @@ gaps of **3.7 s between sync iterations**, which is what 0.1 KB/s transfers look
 Diagnosing this needs per-thread numbers, not inference. `push: iters == got` every second is
 the tell that the pusher never sleeps.
 
-### 6. Silent failures that look like dead hardware
+### 6. Mount runs with nothing feeding the watchdog
+
+`main()` calls `watchdog_init()` (30 s) before `mount_sd_card()`, but `watchdog_feed()` only runs
+in the main loop, which is reached after every init step. So all of mount is one unfed window.
+Reclaiming a large backlog of over-budget segments there exceeded it: the device reset mid-mount,
+trimmed a few more on the next boot, and reset again — presenting as a boot loop with
+`Reset by WATCHDOG` and no BLE, because a failed or incomplete mount stops advertising entirely.
+
+`SEG_BOOT_TRIM_MAX` bounds how much mount will reclaim; the rest drains through normal rotation,
+which runs on the storage thread where a slow eviction cannot starve the watchdog. **Anything new
+added to mount must be bounded the same way.**
+
+### 7. Never touch the filesystem from a GATT handler
+
+`CONFIG_BT_RX_STACK_SIZE` is 1024 (the config carries two commented-out attempts to raise it to
+4096, so this has bitten before). GATT write and read handlers run on that stack, and a FatFs
+directory walk does not fit — the device hard-faults and reboots, which over BLE looks only like
+`bleak.exc.BleakError: disconnected`.
+
+This hid for a long time behind an asymmetry: `get_file_size()` answers for the segment being
+recorded from a RAM counter and never touches the card, so reading the newest segment — the only
+thing the tools did — was safe. **Every other target calls `fs_stat`**: any older segment, and
+any timestamp index. Segment rotation turned that latent bug into a routine one, since a normal
+sync walks older segments.
+
+Size lookups now happen in `setup_storage_tx()` on the storage thread, which also sends
+`ZERO_FILE_SIZE`/`END_OF_TRANSFER` directly, because the transfer loop only speaks when it has
+bytes. Keep it that way: the write handler must stay a cheap parse-and-latch.
+
+**A second instance shipped at the same time**, found only by auditing for the first: setting the
+clock (`time_sync_write_handler` → `rtc_set_epoch` → `storage_index_mark`) wrote an index record —
+`fs_open`/`fs_write`/`fs_sync`/`fs_close`, more filesystem work than the `fs_stat` above — on the
+same 1 KB stack. It would have faulted the device the first time the app synced time, which is the
+one thing that makes the index worth having. `storage_index_mark()` now only latches a request and
+`storage_index_service()` performs it on the storage thread, so the API is safe from any caller
+rather than just that one.
+
+A third is now caught automatically. `.github/scripts/check_ble_handler_filesystem.py` builds a
+call graph from every registered GATT and connection callback and fails if any route reaches
+`fs_*`/`disk_access_*`; it runs locally and in CI through `.github/checks-manifest.yaml`. It was
+validated by reintroducing both bugs above and confirming each is reported with its call chain —
+its own first draft passed while bug one was present, because devkit and omi share 104 function
+names and one image's stub masked the other's implementation, so the images are analysed
+separately.
+
+Reboots are easy to miss from the host — watch the counters on the info characteristic
+(`sync errors` resetting to near zero is the tell) rather than assuming a disconnect was the radio.
+
+### 8. Serial logging is not a reliable observation channel here
+
+Two independent reasons, both of which wasted time in this session:
+
+- The base config sets `CONFIG_CONSOLE=n`, so a fragment that only raises
+  `CONFIG_LOG_DEFAULT_LEVEL` produces **no output at all**. Layer `debug-usb-log.conf` in too.
+- Even with the console on, the log thread runs below the codec (Trap 5), so once recording
+  starts it may never be scheduled. In practice you get the boot log up to exactly
+  `CONFIG_USB_CDC_ACM_RINGBUF_SIZE` (1024) bytes and then silence.
+
+For anything that happens during steady-state recording, **publish a counter on the storage-info
+characteristic and read it over BLE** instead. That is how the eviction bug in Trap 1 was finally
+pinned down, and why `evictions`, `last eviction errno` and `sync errors` are in that payload.
+
+### 9. Silent failures that look like dead hardware
 
 - **Not advertising at all, CPU idle.** `main()` returns early when `mount_sd_card()` fails, so
   BLE never starts. Check the card before suspecting the radio.
@@ -142,9 +219,46 @@ Anything near 0.1 KB/s on sync means thread starvation (Trap 4/5), not the card.
 
 ## On-Card Format
 
-`/SD:/audio/a01.txt` is a raw stream of 440-byte blocks. Within a block, frames are packed as
-`[length][payload]`, and every payload begins with the Opus TOC byte — `0xB0` for the current
-CELT config, constant because the encoder settings are fixed.
+Recording is a **ring of segment files**, `/SD:/audio/aNNNNN.txt`, so it never has to stop: when
+the ring is full the oldest segment is unlinked and a new one is started. Each segment is a raw
+stream of 440-byte blocks, exactly as the single file used to be — nothing about block or frame
+parsing changed.
+
+Why segments rather than wrapping inside one fixed-size file:
+
+- Every write stays a sequential append, so the 8 KB batching in Trap 2 still applies unchanged.
+  Wrapping would mean seek-back writes whose cost on this card was never measured.
+- The write position after a reset is just "the highest-numbered file", so nothing has to be
+  persisted per batch. Persisting a write cursor would have reintroduced exactly the small
+  random writes that Trap 2 exists to avoid.
+- Evicting is one `fs_unlink`, not a rewrite.
+
+The cost is that eviction is coarse — a whole segment disappears at once. That is why the
+default is 128 segments rather than a handful: you lose under 1% of retained audio at a time.
+
+Geometry is derived at mount from `fs_statvfs`, so one image suits any card: 90% of free space,
+divided into `CONFIG_OMI_RING_SEGMENT_COUNT` segments, each rounded to a multiple of **450,560
+bytes** — `lcm(8192, 440)`, so a batch flush never straddles a segment and the 440-byte grid
+never shifts inside one. Segment size is clamped to 3.4 MB–220 MB. Existing segments keep
+whatever size they were written with; only new ones follow the current target.
+
+Set `CONFIG_OMI_RING_SEGMENT_BYTES` to force a size. `ring-fast-rotate.conf` uses the 450,560
+minimum with 3 segments, which turns the whole ring over in about 9 minutes — build it with
+`omi_build_ringtest.sh`. Rotation and eviction are otherwise a once-a-day event and effectively
+untestable.
+
+Two things follow from the ring that callers must respect:
+
+- **Segment numbers are positions, not identities.** `file_num` is 1-based and ordered oldest
+  first, so an eviction or a delete shifts everything above it down. Use the sequence numbers
+  from the info characteristic to track a segment across time.
+- Offsets are **within a segment**, not across the ring.
+
+A card written by the pre-ring firmware has a single `a01.txt`; it is renamed to `a00001.txt` at
+mount rather than orphaned.
+
+Within a block, frames are packed as `[length][payload]`, and every payload begins with the Opus
+TOC byte — `0xB0` for the current CELT config, constant because the encoder settings are fixed.
 
 Two things break naive decoders:
 
@@ -164,8 +278,10 @@ while i + 1 < len(raw):
         i += 1  # resync
 ```
 
-Sidecars: `/SD:/audio/a01.idx` holds 16-byte records (audio offset, epoch, uptime, boot id)
-written every 30 s; `/SD:/info.txt` holds the read offset; `/SD:/boot.bin` holds the boot id.
+Sidecars: each segment has `/SD:/audio/aNNNNN.idx` holding 16-byte records (offset **within that
+segment**, epoch, uptime, boot id) written every 30 s and on rotation; it is unlinked with its
+segment, so the index cannot outgrow the ring. `/SD:/info.txt` holds the read offset;
+`/SD:/boot.bin` holds the boot id.
 
 ## BLE Protocol (host testing)
 
@@ -177,13 +293,32 @@ written every 30 s; `/SD:/info.txt` holds the read offset; `/SD:/boot.bin` holds
 | Storage size (read) | `30295782-4301-eabd-2904-2849adfeae43` |
 | Time sync | `19b10030-e8f2-537e-4f6c-d104768a1214` |
 
-The size characteristic returns `<II` — recording length and saved offset. Commands are six
-bytes, `[cmd, file_no, off>>24, off>>16, off>>8, off]`, with `READ=0, DELETE=1, NUKE=2, STOP=3`.
-A single byte `100` notified back marks end of transfer.
+The size characteristic returns 21 bytes describing the ring. The first two words keep their
+original meaning so a client that reads only 8 bytes still works:
+
+| Offset | Type | Meaning |
+|---|---|---|
+| 0 | `u32` | bytes in the segment being recorded |
+| 4 | `u32` | read offset the device last saved |
+| 8 | `u8` | segments on the card — also the number of the newest |
+| 9 | `u32` | sequence number of the oldest segment |
+| 13 | `u32` | sequence number of the newest segment |
+| 17 | `u32` | current segment size target |
+| 21 | `u8` | segment cap — `count` above this means eviction is failing |
+| 22 | `u32` | successful evictions since boot |
+| 26 | `i32` | errno of the last failed eviction, 0 if none |
+| 30 | `u32` | `fs_sync` failures — expected nonzero, see Trap 1 |
+
+Commands are six bytes, `[cmd, file_no, off>>24, off>>16, off>>8, off]`, with
+`READ=0, DELETE=1, NUKE=2, STOP=3`. A single byte `100` notified back marks end of transfer.
+
+`file_no` is a segment position, 1 to the count above. Setting its high bit (`| 0x80`) reads that
+segment's timestamp index instead of its audio — the index is no longer a reserved file number,
+because every number is now a real segment.
 
 Downloads should start on a 440-byte boundary. `DELETE` used to break recording until reboot;
-`clear_audio_file()` now reopens the handle correctly, but prefer reading from an offset over
-deleting during testing.
+deleting the segment being recorded now opens a fresh one immediately, but prefer reading from an
+offset over deleting during testing.
 
 ## Host Tools
 
@@ -191,11 +326,14 @@ deleting during testing.
 parser and decode to WAV. Run them from that directory, since they import `omi_sd` as a sibling.
 
 ```bash
-python3 info.py                                     # size on card, estimated sync time
+python3 info.py                                     # segments, retention, estimated sync time
 python3 record_and_pull.py 60 ~/Desktop/take1.wav   # record a window, pull it back
-python3 pull_range.py <start> <length> [out.wav]    # re-decode a span already on the card
+python3 pull_range.py <start> <len> [out.wav] [seg] # re-decode a span already on the card
 python3 throughput.py 25                            # sync speed; ~14-16 KB/s is healthy
 ```
+
+`record_and_pull.py` handles a rotation landing inside its window by fetching each part and
+joining them, which is the main thing worth exercising with the `ring-fast-rotate.conf` build.
 
 **The older scripts one level up do not work against this firmware, and fail quietly.** They
 were written for a previous storage protocol that notified 83-byte packets carrying a 4-byte
@@ -226,10 +364,10 @@ them.
   would not reclaim the space either; that would need frames to span blocks, which breaks the
   "each block parses independently" contract both paths rely on.
 - The Zephyr `card_ioctl` fall-through is worked around, not fixed upstream.
-- **A genuinely failing card is currently indistinguishable from that SDK bug.** Because
-  `storage_sync_locked()` swallows every `fs_sync` error, `sync_error_count` (`sdcard.c`) is the
-  only signal that could tell a real fault from the known false one — and nothing reads it.
-  Deliberately accepted; log it periodically if card faults are ever suspected.
+- `sync_error_count` is now published on the storage-info characteristic and shown by `info.py`,
+  so a genuinely failing card is no longer completely indistinguishable from the SDK bug — but
+  only by rate, since the bug makes every sync "fail". A real fault still needs `fs_write`
+  errors to confirm it.
 - Dead code in `transport.c`: the file-scope `static uint32_t offset` is never read or written,
   and the init `memset(storage_temp_data, 0, OPUS_PADDED_LENGTH * 4)` clears 320 bytes of a
   440-byte buffer. Harmless (statics are zero-initialized) but it reads like tail-clearing that

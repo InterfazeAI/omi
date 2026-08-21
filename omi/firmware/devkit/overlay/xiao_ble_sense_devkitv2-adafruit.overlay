@@ -20,7 +20,7 @@
     pinctrl-0 = <&custom_spi>;
     pinctrl-1 = <&custom_spi>;
     pinctrl-names = "default", "sleep";
-    cs-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;  // CS pin on P0.28
+    cs-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;  // CS on P0.02, the pad labelled A0/D0
 
     sdhc0: sdhc@0 {
         compatible = "zephyr,sdhc-spi-slot";

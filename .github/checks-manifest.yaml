@@ -747,6 +747,16 @@ checks:
     triggers: [".github/scripts/guardrail_pulse.py", ".github/scripts/test_guardrail_pulse.py", ".github/workflows/guardrail-baseline-pulse.yml", ".github/guardrail-pulse-history.jsonl", ".github/checks-manifest.yaml"]
     lanes: ["local", "ci"]
     reason: "#9454 weekly baseline health pulse parsing, JSONL record, and 30-day staleness detection"
+  - id: ble-handler-filesystem
+    command: ["python3", ".github/scripts/check_ble_handler_filesystem.py", "--changed-files", "{changed_files}"]
+    triggers: ["omi/firmware/devkit/src/**", "omi/firmware/omi/src/**", ".github/scripts/check_ble_handler_filesystem.py", ".github/checks-manifest.yaml"]
+    lanes: ["local", "ci"]
+    reason: "CONFIG_BT_RX_STACK_SIZE is 1024, so a GATT handler that reaches FatFs overflows the stack and faults the chip, which over BLE looks only like a dropped connection. Two instances shipped in the segment-ring work: fs_stat from parse_storage_command, and an index write from time_sync_write_handler via rtc_set_epoch"
+  - id: ble-handler-filesystem-tests
+    command: ["python3", ".github/scripts/test_check_ble_handler_filesystem.py"]
+    triggers: [".github/scripts/check_ble_handler_filesystem.py", ".github/scripts/test_check_ble_handler_filesystem.py", ".github/checks-manifest.yaml"]
+    lanes: ["local", "ci"]
+    reason: "the guard's first draft passed while the bug it was written for was present, because devkit and omi share 104 function names and one image's stub masked the other's implementation"
 
 exempt:
   - path: ".github/scripts/check-desktop-beta-freshness.py"

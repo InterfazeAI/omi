@@ -29,12 +29,14 @@ LOG_MODULE_REGISTER(storage, CONFIG_LOG_DEFAULT_LEVEL);
 #define INVALID_FILE_SIZE 3
 #define ZERO_FILE_SIZE 4
 #define INVALID_COMMAND 6
+#define END_OF_TRANSFER 100
 
 #define MAX_HEARTBEAT_FRAMES 100
 #define HEARTBEAT 50
 
-// Pseudo-file number that addresses the timestamp index rather than the audio recording.
-#define INDEX_FILE_NUM 2
+// Set on a segment number to address that segment's timestamp index rather than its audio.
+// A flag rather than a reserved number, because every number is now a real segment.
+#define SEGMENT_INDEX_FLAG 0x80
 static void storage_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
 static ssize_t storage_write_handler(struct bt_conn *conn,
                                      const struct bt_gatt_attr *attr,
@@ -58,9 +60,19 @@ static ssize_t storage_read_characteristic(struct bt_conn *conn,
 K_THREAD_STACK_DEFINE(storage_stack, 4096);
 static struct k_thread storage_thread;
 
-extern uint8_t file_count;
 extern uint32_t file_num_array[2];
 void broadcast_storage_packet(struct k_work *work_item);
+
+// Layout of the storage-info characteristic. See storage_read_characteristic().
+#define STORAGE_INFO_BYTES 34
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = v & 0xFF;
+    p[1] = (v >> 8) & 0xFF;
+    p[2] = (v >> 16) & 0xFF;
+    p[3] = (v >> 24) & 0xFF;
+}
 
 static struct bt_gatt_attr storage_service_attr[] = {
     BT_GATT_PRIMARY_SERVICE(&storage_service_uuid),
@@ -101,12 +113,26 @@ static ssize_t storage_read_characteristic(struct bt_conn *conn,
                                            uint16_t offset)
 {
     k_msleep(10);
-    uint32_t amount[2] = {0};
-    for (int i = 0; i < 2; i++) {
-        amount[i] = file_num_array[i];
-    }
-    ssize_t result = bt_gatt_attr_read(conn, attr, buf, len, offset, amount, 2 * sizeof(uint32_t));
-    return result;
+
+    // The first two words keep their original meaning so existing clients that read only 8
+    // bytes still work; the ring geometry is appended after them.
+    uint8_t info[STORAGE_INFO_BYTES];
+    put_le32(info + 0, file_num_array[0]); // bytes in the segment being recorded
+    put_le32(info + 4, file_num_array[1]); // last read offset the device saved
+    info[8] = storage_segment_count();
+    put_le32(info + 9, storage_segment_oldest_seq());
+    put_le32(info + 13, storage_segment_newest_seq());
+    put_le32(info + 17, storage_segment_target_bytes());
+
+    uint32_t evictions = 0, sync_errors = 0;
+    int32_t last_evict_err = 0;
+    storage_ring_stats(&evictions, &last_evict_err, &sync_errors);
+    info[21] = (uint8_t) storage_segment_max_count();
+    put_le32(info + 22, evictions);
+    put_le32(info + 26, (uint32_t) last_evict_err);
+    put_le32(info + 30, sync_errors);
+
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, info, sizeof(info));
 }
 
 uint8_t transport_started = 0;
@@ -122,6 +148,7 @@ static uint8_t tx_buffer_size = 0;
 static uint8_t stop_started = 0;
 static uint8_t delete_started = 0;
 static uint8_t current_read_num = 1;
+static bool current_read_is_index = false;
 uint32_t remaining_length = 0;
 
 static int setup_storage_tx()
@@ -136,32 +163,40 @@ static int setup_storage_tx()
 
     uint32_t total;
 
-    if (current_read_num == INDEX_FILE_NUM) {
-        storage_select_read_target(STORAGE_READ_INDEX);
-        total = index_get_size();
-        LOG_INF("serving timestamp index, %u bytes", total);
-    } else {
-        storage_select_read_target(STORAGE_READ_AUDIO);
-        int res = move_read_pointer(current_read_num);
-        if (res) {
-            LOG_INF("bad pointer");
-            transport_started = 0;
-            current_read_num = 1;
-            remaining_length = 0;
-            return -1;
-        }
-        LOG_INF("current read ptr %d", current_read_num);
-
-        total = file_num_array[current_read_num - 1];
-        if (current_read_num == file_count) {
-            total = get_file_size(file_count);
-        }
+    int res =
+        storage_select_read_target(current_read_num, current_read_is_index ? STORAGE_READ_INDEX : STORAGE_READ_AUDIO);
+    if (res) {
+        LOG_INF("bad pointer");
+        transport_started = 0;
+        current_read_num = 1;
+        current_read_is_index = false;
+        remaining_length = 0;
+        return -1;
     }
 
-    if (offset >= total) {
-        LOG_INF("offset %u is at or past end of file %u, nothing to send", offset, total);
+    if (current_read_is_index) {
+        total = index_get_size_for(current_read_num);
+        LOG_INF("serving timestamp index of segment %u, %u bytes", current_read_num, total);
+    } else {
+        // Always ask the storage layer: only it knows that the newest segment's length lives
+        // in a counter rather than the directory entry.
+        total = get_file_size(current_read_num);
+        LOG_INF("serving segment %u, %u bytes", current_read_num, total);
+    }
+
+    // Both of these used to be answered synchronously by the write handler; they moved here so
+    // that reading the size cannot run on the BT RX stack. The client is told directly, because
+    // the transfer loop below only speaks when it has bytes to send.
+    if (total == 0 || offset >= total) {
+        uint8_t code[1] = {total == 0 ? ZERO_FILE_SIZE : END_OF_TRANSFER};
+        LOG_INF("nothing to send from segment %u: offset %u of %u", current_read_num, offset, total);
+        struct bt_conn *conn = get_current_connection();
+        if (conn) {
+            bt_gatt_notify(conn, &storage_service.attrs[1], code, 1);
+        }
         remaining_length = 0;
         transport_started = 0;
+        current_read_is_index = false;
         return 0;
     }
 
@@ -192,56 +227,35 @@ static uint8_t parse_storage_command(void *buf, uint16_t len)
     }
     LOG_PRINTK("command successful: command: %d file: %d size: %d \n", command, file_num, size);
 
-    if (file_num == 0) {
-        LOG_INF("invalid file count 0");
+    // The timestamp index of a segment is addressed by setting the high bit of its number, so
+    // clients fetch it over the existing transfer path instead of needing a second protocol.
+    const bool want_index = (file_num & SEGMENT_INDEX_FLAG) != 0;
+    const uint8_t seg_num = file_num & ~SEGMENT_INDEX_FLAG;
+
+    if (seg_num == 0 || seg_num > storage_segment_count()) {
+        LOG_INF("invalid segment %u of %u", seg_num, storage_segment_count());
         return INVALID_FILE_SIZE;
     }
 
-    // The timestamp index is addressed as a pseudo-file so clients can fetch it over the
-    // existing transfer path instead of needing a second protocol.
-    if (file_num == INDEX_FILE_NUM) {
-        if (command != READ_COMMAND) {
-            LOG_INF("only reads are supported for the index");
-            return INVALID_COMMAND;
-        }
-        if (index_get_size() == 0) {
-            LOG_INF("index is empty");
-            return ZERO_FILE_SIZE;
-        }
-        offset = size - (size % SD_BLE_SIZE);
-        current_read_num = INDEX_FILE_NUM;
-        transport_started = 1;
-        return 0;
+    if (want_index && command != READ_COMMAND) {
+        LOG_INF("only reads are supported for the index");
+        return INVALID_COMMAND;
     }
 
-    if (file_num > file_count) // invalid file count
-    {
-        LOG_INF("invalid file count");
-        return INVALID_FILE_SIZE;
-        // add audio all?
-    }
     if (command == READ_COMMAND) // read
     {
-        uint32_t temp = file_num_array[file_num - 1];
-        if (file_num == (file_count)) {
-            LOG_INF("file_count == final file");
-            offset = size - (size % SD_BLE_SIZE); // round down to nearest SD_BLE_SIZE
-            current_read_num = file_num;
-            transport_started = 1;
-        } else if (temp == 0) {
-            LOG_INF("file size is 0");
-            return ZERO_FILE_SIZE;
-        } else if (size > temp) {
-            LOG_INF("requested size is too large");
-            return 5;
-        } else {
-            LOG_INF("valid command, setting up ");
-            offset = size - (size % SD_BLE_SIZE);
-            current_read_num = file_num;
-            transport_started = 1;
-        }
+        // Deliberately no filesystem call here. This runs on the BT RX thread, which has a
+        // 1 KB stack (CONFIG_BT_RX_STACK_SIZE); a FatFs directory walk does not fit and faults
+        // the device. It went unnoticed while there was only ever one file, because
+        // get_file_size() answers for the segment being recorded from a counter and never
+        // touches the card -- every other target does. setup_storage_tx() now decides the size
+        // on the storage thread and reports an empty or exhausted target from there.
+        offset = size - (size % SD_BLE_SIZE); // round down to nearest SD_BLE_SIZE
+        current_read_num = seg_num;
+        current_read_is_index = want_index;
+        transport_started = 1;
     } else if (command == DELETE_COMMAND) {
-        delete_num = file_num;
+        delete_num = seg_num;
         delete_started = 1;
     } else if (command == NUKE) {
         nuke_started = 1;
@@ -340,8 +354,8 @@ void storage_write(void)
         }
         // probably prefer to implement using work orders for delete,nuke,etc...
         if (delete_started) {
-            LOG_INF("delete:%d\n", delete_started);
-            int err = clear_audio_file(1);
+            LOG_INF("deleting segment %d", delete_num);
+            int err = clear_audio_file(delete_num);
             offset = 0;
             save_offset(offset);
 
@@ -361,6 +375,8 @@ void storage_write(void)
             save_offset(0);
             nuke_started = 0;
         }
+        // Time sync arrives on the BT RX thread, which cannot write the record itself.
+        storage_index_service();
         if (stop_started) {
             remaining_length = 0;
             stop_started = 0;
@@ -394,7 +410,7 @@ void storage_write(void)
                     stop_started = 0;
                 } else {
                     LOG_PRINTK("done. attempting to download more files\n");
-                    uint8_t stop_result[1] = {100};
+                    uint8_t stop_result[1] = {END_OF_TRANSFER};
                     int err = bt_gatt_notify(get_current_connection(), &storage_service.attrs[1], &stop_result, 1);
                     k_sleep(K_MSEC(10));
                 }

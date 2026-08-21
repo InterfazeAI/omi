@@ -25,10 +25,25 @@ async def main():
     print(f"\n  {device.name or 'unnamed'}  [{device.address}]")
     async with BleakClient(device, timeout=25.0) as client:
         await asyncio.sleep(2.0)
-        total, saved = await omi_sd.read_size(client)
+        info = await omi_sd.read_info(client)
 
-    print(f"  recording   {total:,} bytes  (~{total/BYTES_PER_SECOND/60:.1f} min of audio)")
-    print(f"  read offset {saved:,} bytes")
+    total = info.total_bytes
+    print(f"  segments    {info.count} on card, sequence {info.oldest_seq}..{info.newest_seq}")
+    print(f"  segment     {info.segment_bytes:,} bytes "
+          f"(~{info.segment_bytes/BYTES_PER_SECOND/60:.0f} min each)")
+    print(f"  recording   segment {info.count}, {info.newest_bytes:,} bytes so far")
+    print(f"  retained    ~{total:,} bytes (~{total/BYTES_PER_SECOND/3600:.1f} h of audio)")
+    print(f"  read offset {info.saved_offset:,} bytes")
+    if info.max_count:
+        health = f"  ring        cap {info.max_count} segments, {info.evictions} evicted"
+        if info.last_evict_err:
+            health += f", LAST EVICTION FAILED errno {info.last_evict_err}"
+        if info.count > info.max_count:
+            health += f"  <-- OVER CAP by {info.count - info.max_count}"
+        print(health)
+        # fs_sync always fails on SD in this SDK (see DEBUGGING.md trap 1), so a nonzero count
+        # is expected; a count that stays at 0 while recording would be the surprise.
+        print(f"  sync errors {info.sync_errors:,} (expected nonzero, known SDK bug)")
     print(f"  full sync   ~{total/1024/SYNC_KB_PER_SECOND/60:.1f} min at {SYNC_KB_PER_SECOND:.0f} KB/s\n")
 
 

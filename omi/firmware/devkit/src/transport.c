@@ -27,7 +27,6 @@
 LOG_MODULE_REGISTER(transport, CONFIG_LOG_DEFAULT_LEVEL);
 
 extern bool is_connected;
-extern uint8_t file_count;
 extern uint32_t file_num_array[2];
 struct bt_conn *current_connection = NULL;
 uint16_t current_mtu = 0;

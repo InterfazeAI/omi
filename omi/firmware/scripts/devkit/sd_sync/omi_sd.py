@@ -8,6 +8,7 @@ import asyncio
 import ctypes
 import ctypes.util
 import struct
+import sys
 import time
 import wave
 
@@ -21,9 +22,17 @@ SIZE_CHAR = "30295782-4301-eabd-2904-2849adfeae43"
 READ_COMMAND, DELETE_COMMAND, NUKE_COMMAND, STOP_COMMAND = 0, 1, 2, 3
 END_OF_TRANSFER = 100
 
+# Set on a segment number to address that segment's timestamp index instead of its audio.
+SEGMENT_INDEX_FLAG = 0x80
+
 SD_BLE_SIZE = 440
 RATE = 16000
 FRAME_SAMPLES = 160
+
+# Ask for more than any file holds to mean "read to the end"; the firmware ends the transfer
+# itself. download() recognises it and reports progress without a percentage, since the total
+# is unknown until the transfer stops.
+READ_TO_EOF = 1 << 26
 
 # Every Opus payload starts with this TOC byte while the encoder config is fixed (CELT, 16kHz,
 # 10ms frames). It is what makes resynchronising possible.
@@ -50,6 +59,78 @@ _opus.opus_decode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32,
                               ctypes.POINTER(ctypes.c_int16), ctypes.c_int, ctypes.c_int]
 
 
+def format_size(count):
+    return f"{count/1_048_576:.1f} MB" if count >= 1_048_576 else f"{count/1024:.0f} KB"
+
+
+def format_duration(seconds):
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+class Progress:
+    """Live transfer progress.
+
+    A sync of any length runs for minutes at ~15 KB/s, and printing nothing until it finished
+    was indistinguishable from a hang. Rewrites a single line on a terminal; when the output is
+    a file or a pipe it prints far less often, so logs stay readable.
+    """
+
+    def __init__(self, label, total):
+        self.label = label
+        self.total = total
+        self.terminal = sys.stdout.isatty()
+        self.interval = 2.0 if self.terminal else 15.0
+        self.started = time.time()
+        self.marked_at = self.started
+        self.marked_bytes = 0
+        # Wait a full interval before the first line, so a transfer that finishes quickly —
+        # an index is a couple of KB — reports once rather than twice.
+        self.printed_at = self.started
+
+    def update(self, done):
+        now = time.time()
+        if now - self.printed_at < self.interval:
+            return
+        window = now - self.marked_at
+        rate = (done - self.marked_bytes) / window if window > 0 else 0.0
+        self.marked_at, self.marked_bytes, self.printed_at = now, done, now
+        self._render(done, rate, now - self.started, final=False)
+
+    def finish(self, done):
+        elapsed = time.time() - self.started
+        self._render(done, done / elapsed if elapsed > 0 else 0.0, elapsed, final=True)
+        return elapsed
+
+    def _render(self, done, rate, elapsed, final):
+        fields = [self.label]
+        if self.total:
+            # The last notification can carry past the requested length; the extra is trimmed
+            # off the saved data, so reporting over 100% would only look like a fault.
+            done = min(done, self.total)
+            fields.append(f"{100 * done / self.total:4.0f}%")
+            fields.append(f"{format_size(done)} of {format_size(self.total)}")
+        else:
+            fields.append(format_size(done))
+        fields.append(f"{rate/1024:.1f} KB/s")
+        if final:
+            fields.append(f"in {format_duration(elapsed)}")
+        else:
+            if self.total and rate > 0:
+                fields.append(f"eta {format_duration((self.total - done) / rate)}")
+            fields.append(format_duration(elapsed))
+
+        line = "  " + "   ".join(fields)
+        if self.terminal:
+            print("\r" + line.ljust(76), end="\n" if final else "", flush=True)
+        else:
+            print(line, flush=True)
+
+
 async def find_device(timeout=120):
     """Scan until the recorder shows up. It only advertises once the SD card has mounted."""
     deadline = time.time() + timeout
@@ -62,9 +143,50 @@ async def find_device(timeout=120):
     return None
 
 
+class RingInfo:
+    """What the storage-info characteristic reports about the recording ring.
+
+    Recording is a ring of segment files. `count` of them are on the card; they are addressed
+    by a 1-based number, oldest first, so `count` is always the one being recorded into.
+    Deleting a segment shifts the numbers above it down by one.
+    """
+
+    def __init__(self, raw):
+        self.newest_bytes, self.saved_offset = struct.unpack("<II", raw[:8])
+        if len(raw) >= 21:
+            self.count = raw[8]
+            self.oldest_seq, self.newest_seq, self.segment_bytes = struct.unpack("<III", raw[9:21])
+        else:
+            # Pre-ring firmware: a single file that grows until it stops.
+            self.count, self.oldest_seq, self.newest_seq = 1, 1, 1
+            self.segment_bytes = 0
+
+        if len(raw) >= 34:
+            self.max_count = raw[21]
+            self.evictions, last_err, self.sync_errors = struct.unpack("<IiI", raw[22:34])
+            self.last_evict_err = last_err
+        else:
+            self.max_count = 0
+            self.evictions = self.sync_errors = self.last_evict_err = 0
+
+    @property
+    def total_bytes(self):
+        """Approximate total across the ring; only the newest segment's length is exact."""
+        return (self.count - 1) * self.segment_bytes + self.newest_bytes
+
+    def __str__(self):
+        return (f"{self.count} segments (seq {self.oldest_seq}..{self.newest_seq}), "
+                f"{self.segment_bytes:,} B each, newest holds {self.newest_bytes:,} B")
+
+
+async def read_info(client):
+    return RingInfo(await client.read_gatt_char(SIZE_CHAR))
+
+
 async def read_size(client):
-    """Returns (recording length, saved read offset)."""
-    return struct.unpack("<II", (await client.read_gatt_char(SIZE_CHAR))[:8])
+    """Returns (length of the segment being recorded, saved read offset)."""
+    info = await read_info(client)
+    return info.newest_bytes, info.saved_offset
 
 
 def _command(cmd, offset=0, file_no=1):
@@ -73,14 +195,22 @@ def _command(cmd, offset=0, file_no=1):
                   (offset >> 8) & 0xFF, offset & 0xFF])
 
 
-async def download(client, start, length, stall_limit=10):
-    """Pulls `length` bytes from `start`. Returns (data, seconds elapsed).
+async def download(client, start, length, segment=None, stall_limit=10, want_index=False, label=None):
+    """Pulls `length` bytes from `start` within `segment`. Returns (data, seconds elapsed).
 
-    `start` is rounded down to a block boundary: the firmware serves 440-byte blocks and a
-    mid-block start makes every following frame unparseable.
+    `segment` defaults to the one currently being recorded into. `start` is rounded down to a
+    block boundary: the firmware serves 440-byte blocks and a mid-block start makes every
+    following frame unparseable. Pass READ_TO_EOF as `length` to take the rest of the file.
     """
+    if segment is None:
+        segment = (await read_info(client)).count
+    file_no = segment | SEGMENT_INDEX_FLAG if want_index else segment
+
     start -= start % SD_BLE_SIZE
     chunks, done = [], asyncio.Event()
+    if label is None:
+        label = f"{'index' if want_index else 'audio'} seg {segment}"
+    progress = Progress(label, None if length >= READ_TO_EOF else length)
 
     def on_notify(_, data):
         payload = bytes(data)
@@ -91,17 +221,20 @@ async def download(client, start, length, stall_limit=10):
             chunks.append(payload)
 
     await client.start_notify(CMD_CHAR, on_notify)
-    await client.write_gatt_char(CMD_CHAR, _command(READ_COMMAND, start), response=True)
+    await client.write_gatt_char(CMD_CHAR, _command(READ_COMMAND, start, file_no), response=True)
 
-    seen, stalled, began = 0, 0, time.time()
+    seen, stalled = 0, 0
     while not done.is_set():
         await asyncio.sleep(1.0)
         got = sum(len(c) for c in chunks)
         stalled = stalled + 1 if got == seen else 0
         seen = got
+        progress.update(got)
         if got >= length or stalled >= stall_limit:
             break
-    elapsed = time.time() - began
+    elapsed = progress.finish(min(seen, length))
+    if stalled >= stall_limit:
+        print(f"  stalled for {stall_limit}s with no data; ending this transfer early")
 
     try:
         await client.write_gatt_char(CMD_CHAR, _command(STOP_COMMAND), response=True)
@@ -156,15 +289,21 @@ def write_wav(path, samples):
 
 
 def save_and_report(raw, elapsed, out_path):
-    """Parse, decode, write and print the usual summary. Returns True if anything decoded."""
-    print(f"  downloaded {len(raw):,} bytes in {elapsed:.0f}s = "
-          f"{len(raw)/max(elapsed,1)/1024:.1f} KB/s", flush=True)
+    """Parse, decode, write and print the usual summary.
 
+    Returns the decoded duration in seconds, or None if nothing decoded — so callers can both
+    test it for success and use it to place the audio in time.
+    """
+    print(f"  transferred {format_size(len(raw))} in {format_duration(elapsed)} "
+          f"({len(raw)/max(elapsed, 1)/1024:.1f} KB/s average)", flush=True)
+
+    began = time.time()
     frames, skipped = parse_frames(raw)
     samples, bad = decode(frames)
     if len(samples) == 0:
         print("  DECODE FAILED - no frames recovered")
-        return False
+        return None
+    print(f"  decoded in {format_duration(time.time() - began)}")
 
     write_wav(out_path, samples)
     scaled = samples.astype(np.float64) / 32768.0
@@ -176,4 +315,4 @@ def save_and_report(raw, elapsed, out_path):
     if peak >= 0.999:
         print("  NOTE: clipping at full scale - lower MIC_GAIN in config.h")
     print(f"  WAV -> {out_path}")
-    return True
+    return len(samples) / RATE

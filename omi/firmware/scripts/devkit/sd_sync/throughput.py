@@ -24,8 +24,11 @@ async def main():
 
     async with BleakClient(device, timeout=25.0) as client:
         await asyncio.sleep(2.0)
-        total, _ = await omi_sd.read_size(client)
-        start = max(0, total - 300_000)
+        info = await omi_sd.read_info(client)
+        # Measure against the segment being recorded, which is the contended case: the reader
+        # and the recorder are then competing for the same file and the same mutex.
+        segment = info.count
+        start = max(0, info.newest_bytes - 300_000)
         got = [0]
 
         def on_notify(_, data):
@@ -33,10 +36,10 @@ async def main():
                 got[0] += len(bytes(data))
 
         await client.start_notify(omi_sd.CMD_CHAR, on_notify)
-        print(f"  pulling from {start:,} of {total:,}", flush=True)
+        print(f"  pulling from {start:,} of {info.newest_bytes:,} in segment {segment}", flush=True)
         await client.write_gatt_char(
             omi_sd.CMD_CHAR,
-            bytes([omi_sd.READ_COMMAND, 1, (start >> 24) & 0xFF, (start >> 16) & 0xFF,
+            bytes([omi_sd.READ_COMMAND, segment, (start >> 24) & 0xFF, (start >> 16) & 0xFF,
                    (start >> 8) & 0xFF, start & 0xFF]),
             response=True)
 
