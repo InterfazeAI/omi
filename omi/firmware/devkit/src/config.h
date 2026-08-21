@@ -24,10 +24,18 @@
 #if CODEC_OPUS
 #define CODEC_PACKAGE_SAMPLES 160
 #define CODEC_OUTPUT_MAX_BYTES CODEC_PACKAGE_SAMPLES * 2 // Let's assume that 16bit is enough
+// CELT, not SILK. SILK codes speech far smaller at these rates, but measured 12ms to encode
+// each 10ms frame on this part -- slower than real time, which starved the recorder and the
+// BLE sync down to 0.1 KB/s. CELT fits the budget; the bitrate below buys back the size.
 #define CODEC_OPUS_APPLICATION OPUS_APPLICATION_RESTRICTED_LOWDELAY
-#define CODEC_OPUS_BITRATE 32000
+// 20k rather than 32k: 1.7x less card space and sync time (143KB vs 240KB per minute, 10s
+// vs 18s to pull), for no measurable CPU difference. Listening comparison found 32k clearly
+// better on soft sounds, so raise this if quiet speech matters more than capacity.
+#define CODEC_OPUS_BITRATE 20000
 #define CODEC_OPUS_VBR 1 // Or 1
 #define CODEC_OPUS_COMPLEXITY 3
+// DTX exists only in SILK, so it does nothing here. Silence costs full bitrate under CELT.
+#define CODEC_OPUS_DTX 0
 #endif
 #define CONFIG_OPUS_MODE CONFIG_OPUS_MODE_CELT
 

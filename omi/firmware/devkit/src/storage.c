@@ -32,6 +32,9 @@ LOG_MODULE_REGISTER(storage, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define MAX_HEARTBEAT_FRAMES 100
 #define HEARTBEAT 50
+
+// Pseudo-file number that addresses the timestamp index rather than the audio recording.
+#define INDEX_FILE_NUM 2
 static void storage_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
 static ssize_t storage_write_handler(struct bt_conn *conn,
                                      const struct bt_gatt_attr *attr,
@@ -80,12 +83,8 @@ static struct bt_gatt_attr storage_service_attr[] = {
 
 struct bt_gatt_service storage_service = BT_GATT_SERVICE(storage_service_attr);
 
-bool storage_is_on = false;
-
 static void storage_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
 {
-
-    storage_is_on = true;
     if (value == BT_GATT_CCC_NOTIFY) {
         LOG_INF("Client subscribed for notifications");
     } else if (value == 0) {
@@ -128,28 +127,46 @@ uint32_t remaining_length = 0;
 static int setup_storage_tx()
 {
     transport_started = (uint8_t) 0;
-    // offset = 0;
     LOG_INF("about to transmit storage\n");
     k_msleep(1000);
-    int res = move_read_pointer(current_read_num);
-    if (res) {
-        LOG_INF("bad pointer");
-        transport_started = 0;
-        current_read_num = 1;
+
+    // Recording continues during a sync, so commit the in-flight block before measuring:
+    // the client should be able to pull everything captured up to this moment.
+    storage_flush();
+
+    uint32_t total;
+
+    if (current_read_num == INDEX_FILE_NUM) {
+        storage_select_read_target(STORAGE_READ_INDEX);
+        total = index_get_size();
+        LOG_INF("serving timestamp index, %u bytes", total);
+    } else {
+        storage_select_read_target(STORAGE_READ_AUDIO);
+        int res = move_read_pointer(current_read_num);
+        if (res) {
+            LOG_INF("bad pointer");
+            transport_started = 0;
+            current_read_num = 1;
+            remaining_length = 0;
+            return -1;
+        }
+        LOG_INF("current read ptr %d", current_read_num);
+
+        total = file_num_array[current_read_num - 1];
+        if (current_read_num == file_count) {
+            total = get_file_size(file_count);
+        }
+    }
+
+    if (offset >= total) {
+        LOG_INF("offset %u is at or past end of file %u, nothing to send", offset, total);
         remaining_length = 0;
-        return -1;
+        transport_started = 0;
+        return 0;
     }
 
-    LOG_INF("current read ptr %d", current_read_num);
+    remaining_length = total - offset;
 
-    remaining_length = file_num_array[current_read_num - 1];
-    if (current_read_num == file_count) {
-        remaining_length = get_file_size(file_count);
-    }
-
-    remaining_length = remaining_length - offset;
-
-    // offset=offset_;
     LOG_INF("remaining length: %d", remaining_length);
     LOG_INF("offset: %d", offset);
     LOG_INF("file: %d", current_read_num);
@@ -179,6 +196,24 @@ static uint8_t parse_storage_command(void *buf, uint16_t len)
         LOG_INF("invalid file count 0");
         return INVALID_FILE_SIZE;
     }
+
+    // The timestamp index is addressed as a pseudo-file so clients can fetch it over the
+    // existing transfer path instead of needing a second protocol.
+    if (file_num == INDEX_FILE_NUM) {
+        if (command != READ_COMMAND) {
+            LOG_INF("only reads are supported for the index");
+            return INVALID_COMMAND;
+        }
+        if (index_get_size() == 0) {
+            LOG_INF("index is empty");
+            return ZERO_FILE_SIZE;
+        }
+        offset = size - (size % SD_BLE_SIZE);
+        current_read_num = INDEX_FILE_NUM;
+        transport_started = 1;
+        return 0;
+    }
+
     if (file_num > file_count) // invalid file count
     {
         LOG_INF("invalid file count");
@@ -275,14 +310,23 @@ static void write_to_gatt(struct bt_conn *conn)
     uint32_t packet_size = MIN(remaining_length, SD_BLE_SIZE);
 
     int r = read_audio_data(storage_write_buffer, packet_size, offset);
-    offset = offset + packet_size;
+    if (r <= 0) {
+        LOG_ERR("storage read failed at offset %u: %d", offset, r);
+        remaining_length = 0;
+        return;
+    }
+    packet_size = (uint32_t) r;
+
     int err = bt_gatt_notify(conn, &storage_service.attrs[1], &storage_write_buffer, packet_size);
     if (err) {
         LOG_PRINTK("error writing to gatt: %d\n", err);
-    } else {
-        remaining_length = remaining_length - SD_BLE_SIZE;
+        return; // leave offset and remaining_length alone so the block is retried
     }
-    // LOG_PRINTK("wrote to gatt %d\n",err);
+
+    // Advancing by the actual packet size matters on the final block: subtracting a full
+    // SD_BLE_SIZE from a shorter tail wrapped remaining_length around to a huge value.
+    offset += packet_size;
+    remaining_length -= MIN(remaining_length, packet_size);
 }
 
 void storage_write(void)
@@ -321,6 +365,7 @@ void storage_write(void)
             remaining_length = 0;
             stop_started = 0;
             save_offset(offset);
+            storage_read_close();
         }
         if (heartbeat_count == MAX_HEARTBEAT_FRAMES) {
             LOG_PRINTK("no heartbeat sent\n");
@@ -334,9 +379,8 @@ void storage_write(void)
                 LOG_ERR("invalid connection");
                 remaining_length = 0;
                 save_offset(offset);
-                // save offset to flash
+                storage_read_close();
                 continue;
-                // k_yield();
             }
             // LOG_PRINTK("remaining length: %d\n",remaining_length);
 
@@ -345,6 +389,7 @@ void storage_write(void)
 
             transport_started = 0;
             if (remaining_length == 0) {
+                storage_read_close();
                 if (stop_started) {
                     stop_started = 0;
                 } else {

@@ -1,0 +1,7 @@
+# PlatformIO build output and toolchain state
+.pio/
+.piovenv/
+
+# Packaged firmware images
+*.uf2
+*.bin

@@ -14,6 +14,7 @@ target_sources(app PRIVATE
     src/lib/battery/battery.c
     src/button.c
     src/speaker.c
+    src/rtc.c
     src/sdcard.c
     src/storage.c
     src/usb.c

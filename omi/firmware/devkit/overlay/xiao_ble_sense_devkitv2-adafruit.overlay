@@ -31,7 +31,10 @@
             compatible = "zephyr,sdmmc-disk";
             status = "okay";
         };
-        spi-max-frequency = <24000000>;  // 24 MHz SPI speed for SD card
+        // 8 MHz rather than 24 for margin on hand-wired jumpers. Note this did NOT fix the
+        // -EIO on every fs_sync seen on this board, so the card/filesystem is the suspect
+        // there, not the clock. 8 MHz still far exceeds what the BLE link can drain.
+        spi-max-frequency = <8000000>;
     };
 };
 

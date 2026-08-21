@@ -11,6 +11,7 @@ import 'package:omi/backend/schema/conversation.dart';
 import 'package:omi/models/sync_state.dart';
 import 'package:omi/services/devices/ring_protocol.dart';
 import 'package:omi/services/services.dart';
+import 'package:omi/services/wals/ring_session_timeline.dart';
 import 'package:omi/services/wals/wal.dart';
 import 'package:omi/services/wals/wal_interfaces.dart';
 
@@ -32,6 +33,12 @@ import 'package:omi/services/wals/wal_interfaces.dart';
 /// AND every chunk we received during the transfer has been handed to LocalWalSync.
 /// On any failure (cancel, BLE drop, NOTIFY_DONE error status) the ring is left
 /// untouched — the next sync session resumes from the same read_seq.
+///
+/// Timeline invariant: the record stream is NOT necessarily continuous. Firmware
+/// that gates recording on voice activity emits one contiguous run of records per
+/// speech session and nothing in between, so elapsed frames stop equalling
+/// elapsed time. Every record carries its own timestamp precisely so the consumer
+/// can notice the jump; see [RingSessionTimeline].
 class RingStorageSyncImpl implements RingStorageSync {
   List<Wal> _wals = [];
   BtDevice? _device;
@@ -53,6 +60,13 @@ class RingStorageSyncImpl implements RingStorageSync {
   double _currentSpeedKBps = 0.0;
   @override
   double get currentSpeedKBps => _currentSpeedKBps;
+
+  /// How far a record's own timestamp may run ahead of the frame-count
+  /// extrapolation before we treat it as a new recording session rather than
+  /// rounding noise. Record timestamps have one-second resolution and the
+  /// extrapolation truncates, so a couple of seconds of slack is expected even
+  /// on genuinely continuous audio.
+  static const int gapToleranceSecs = 3;
 
   RingStorageSyncImpl(this.listener);
 
@@ -367,12 +381,15 @@ class RingStorageSyncImpl implements RingStorageSync {
 
     final completer = Completer<bool>();
     final reassembler = RingRecordReassembler();
-    final List<List<int>> bytesData = []; // parsed opus frames awaiting flush
     int recordsConsumed = 0;
-    int? firstRecordTs;
-    int chunkTimerStart = 0; // updated as chunks flush
+    bool anchored = false;
     final fps = wal.codec.getFramesPerSecond();
     final chunkFrames = sdcardChunkSizeSecs * fps;
+    final timeline = RingSessionTimeline(
+      framesPerSecond: fps,
+      chunkFrames: chunkFrames,
+      gapToleranceSecs: gapToleranceSecs,
+    );
     int? doneNextSeq;
     bool doneOk = false;
     bool flushError = false;
@@ -383,22 +400,20 @@ class RingStorageSyncImpl implements RingStorageSync {
     DateTime lastProgressUpdate = DateTime.now();
     const progressInterval = Duration(milliseconds: 200);
 
-    // Flush exactly [chunkFrames] frames at a time; on DONE, flush whatever is left.
+    // One chunk at a time, so a write that throws leaves the rest of the
+    // timeline intact for the final flush to retry.
     Future<void> flushChunks({required bool finalFlush}) async {
-      while (bytesData.length >= chunkFrames || (finalFlush && bytesData.isNotEmpty)) {
-        final take = bytesData.length >= chunkFrames ? chunkFrames : bytesData.length;
-        final chunk = bytesData.sublist(0, take);
-        bytesData.removeRange(0, take);
+      while (true) {
+        final chunk = timeline.takeChunk(finalFlush: finalFlush);
+        if (chunk == null) break;
         try {
-          final file = await _flushToDisk(wal, chunk, chunkTimerStart);
-          await _registerWithLocalSync(wal, file, chunkTimerStart, chunk.length);
+          final file = await _flushToDisk(wal, chunk.frames, chunk.timerStart);
+          await _registerWithLocalSync(wal, file, chunk.timerStart, chunk.frames.length);
         } catch (e) {
           Logger.debug('RingStorageSync._syncRing: flush error: $e');
           flushError = true;
           rethrow;
         }
-        chunkTimerStart += chunk.length ~/ (fps == 0 ? 1 : fps);
-        if (finalFlush && bytesData.isEmpty) break;
       }
     }
 
@@ -466,21 +481,24 @@ class RingStorageSyncImpl implements RingStorageSync {
         for (final record in reassembler.drainRecords()) {
           final ts = RingProtocol.readRecordTimestamp(record);
 
-          // Anchor timerStart on the first usable timestamp.
-          if (firstRecordTs == null) {
+          // Anchor on the first usable timestamp. When the device says its clock
+          // was never synced, its timestamps are meaningless, so fall back to
+          // `now - estimated duration` and stop reading them entirely.
+          if (!anchored) {
+            anchored = true;
             if (rtcValid && ts > 0) {
-              firstRecordTs = ts;
-              chunkTimerStart = ts;
+              timeline.anchor(ts);
             } else {
-              // Fallback: now - estimated duration of the unread region.
               final estSecs = wal.totalFrames ~/ (fps == 0 ? 1 : fps);
-              firstRecordTs = DateTime.now().millisecondsSinceEpoch ~/ 1000 - estSecs;
-              chunkTimerStart = firstRecordTs!;
+              timeline.anchor(DateTime.now().millisecondsSinceEpoch ~/ 1000 - estSecs);
             }
           }
 
           final audio = record.sublist(RingProtocol.timestampBytes);
-          bytesData.addAll(RingProtocol.parseAudioPayload(audio));
+          timeline.addRecord(
+            timestamp: rtcValid ? ts : null,
+            frames: RingProtocol.parseAudioPayload(audio),
+          );
           recordsConsumed += 1;
         }
 
@@ -504,14 +522,13 @@ class RingStorageSyncImpl implements RingStorageSync {
         // Flush full chunks as we go (data safety: even if BLE drops mid-stream,
         // already-flushed chunks land in LocalWalSync and reach the cloud).
         //
-        // Single in-flight flush at a time. flushChunks loops while bytesData
-        // has >= chunkFrames, so additional NOTIFY_DATA arriving during a flush
-        // are absorbed by the in-flight task's next iteration. Without this
-        // guard, two concurrent flush closures would both read chunkTimerStart
-        // before either updated it, producing overlapping timestamps in
-        // LocalWalSync. We hold the Future so the post-DONE final flush can
-        // await any flush still in flight before draining the tail.
-        if (inFlightFlush == null && bytesData.length >= chunkFrames) {
+        // Single in-flight flush at a time. flushChunks drains the timeline, so
+        // NOTIFY_DATA arriving during a flush is absorbed by the in-flight
+        // task's next iteration. Two concurrent flush closures would interleave
+        // their writes with the timeline's chunk clock, producing overlapping
+        // timestamps in LocalWalSync. We hold the Future so the post-DONE final
+        // flush can await any flush still in flight before draining the tail.
+        if (inFlightFlush == null && timeline.hasChunkReady) {
           inFlightFlush = () async {
             try {
               await flushChunks(finalFlush: false);
@@ -573,7 +590,7 @@ class RingStorageSyncImpl implements RingStorageSync {
 
     // Wait for any flush still in flight from the streaming phase before
     // draining the tail — otherwise the final flush could race the in-flight
-    // one on bytesData and chunkTimerStart.
+    // one on the timeline.
     final pendingFlush = inFlightFlush;
     if (pendingFlush != null) {
       try {

@@ -5,14 +5,68 @@
 #include <stdint.h>
 
 /**
- * @brief Mount the SD Card. Initializes the audio files
+ * @brief Mount the SD Card and open the recording for append
  *
- * Mounts the SD Card and initializes the audio files. If the SD card does not contain those files, the
- * function will create them.
+ * Mounts the SD Card and opens the audio file, creating it only when absent so that a
+ * recording survives power cycles. The card is never reformatted automatically.
  *
  * @return 0 if successful, negative errno code if error
  */
 int mount_sd_card(void);
+
+/**
+ * @brief Commit buffered audio to the card
+ *
+ * Writes are synced periodically; call this to force a commit, e.g. before a BLE sync so the
+ * reader observes everything captured so far.
+ *
+ * @return 0 if successful, negative errno code if error
+ */
+int storage_flush(void);
+
+/**
+ * @brief Current length of the recording in bytes
+ *
+ * Tracked live against the open append handle, so it stays correct between syncs.
+ */
+uint32_t storage_get_size(void);
+
+/**
+ * @brief Release the read handle and cache used while serving a sync
+ *
+ * Call when a transfer finishes or is aborted. Reads re-open lazily.
+ */
+void storage_read_close(void);
+
+#define STORAGE_READ_AUDIO 0
+#define STORAGE_READ_INDEX 1
+
+/**
+ * @brief Choose which file subsequent read_audio_data() calls serve.
+ *
+ * Used to hand the timestamp index to a client over the same transfer path as the audio.
+ */
+void storage_select_read_target(int target);
+
+/**
+ * @brief Size of the timestamp index in bytes, 0 if absent.
+ */
+uint32_t index_get_size(void);
+
+/**
+ * @brief Append a timestamp record mapping the current audio offset to the current time.
+ *
+ * @param force Write immediately rather than waiting for the next interval.
+ */
+void storage_index_mark(bool force);
+
+/**
+ * @brief Load/store the power-on counter kept on the card.
+ *
+ * @return 0 on success, negative errno otherwise.
+ */
+int storage_load_boot_id(uint32_t *out);
+int storage_save_boot_id(uint32_t id);
 
 /**
  * @brief Create a file

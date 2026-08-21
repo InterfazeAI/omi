@@ -1,11 +1,15 @@
 #include "codec.h"
 
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/printk.h>
 #include <zephyr/sys/ring_buffer.h>
 
 #include "config.h"
 #include "utils.h"
 #ifdef CODEC_OPUS
+// Brings in CONFIG_OPUS_MODE_CELT/HYBRID. Without it those are undefined here and every
+// "CONFIG_OPUS_MODE == ..." test below compares 0 to 0, matching each branch at once.
+#include "lib/opus-1.2.1/config.h"
 #include "lib/opus-1.2.1/opus.h"
 #endif
 
@@ -55,7 +59,9 @@ uint16_t execute_codec();
 #define OPUS_ENCODER_SIZE 7180
 #endif
 #if (CONFIG_OPUS_MODE == CONFIG_OPUS_MODE_HYBRID)
-#define OPUS_ENCODER_SIZE 10916
+// Measured via opus_encoder_get_size(1) for this fixed-point build; the previous 10916 was
+// stale and left the encoder buffer too small, which the boot-time check below now reports.
+#define OPUS_ENCODER_SIZE 15896
 #endif
 __ALIGN(4)
 static uint8_t m_opus_encoder[OPUS_ENCODER_SIZE];
@@ -95,7 +101,15 @@ int codec_start()
 
 // OPUS
 #if CODEC_OPUS
-    ASSERT_TRUE(opus_encoder_get_size(1) == sizeof(m_opus_encoder));
+    // Too small corrupts memory, so it must still abort - but report it, because a bare assert
+    // here surfaces only as a silent boot loop. Oversized is merely wasted RAM, not a fault.
+    const size_t encoder_size_needed = opus_encoder_get_size(1);
+    if (encoder_size_needed != sizeof(m_opus_encoder)) {
+        printk("OPUS_ENCODER_SIZE is %u, opus wants %u\n",
+               (unsigned) sizeof(m_opus_encoder),
+               (unsigned) encoder_size_needed);
+    }
+    ASSERT_TRUE(encoder_size_needed <= sizeof(m_opus_encoder));
     ASSERT_TRUE(opus_encoder_init(m_opus_state, 16000, 1, CODEC_OPUS_APPLICATION) == OPUS_OK);
     ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_BITRATE(CODEC_OPUS_BITRATE)) == OPUS_OK);
     ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_VBR(CODEC_OPUS_VBR)) == OPUS_OK);
@@ -103,7 +117,7 @@ int codec_start()
     ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_COMPLEXITY(CODEC_OPUS_COMPLEXITY)) == OPUS_OK);
     ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE)) == OPUS_OK);
     ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_LSB_DEPTH(16)) == OPUS_OK);
-    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_DTX(0)) == OPUS_OK);
+    ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_DTX(CODEC_OPUS_DTX)) == OPUS_OK);
     ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_INBAND_FEC(0)) == OPUS_OK);
     ASSERT_TRUE(opus_encoder_ctl(m_opus_state, OPUS_SET_PACKET_LOSS_PERC(0)) == OPUS_OK);
 #endif

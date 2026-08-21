@@ -7,6 +7,7 @@
 #include "config.h"
 #include "led.h"
 #include "mic.h"
+#include "rtc.h"
 #include "sdcard.h"
 #include "speaker.h"
 #include "storage.h"
@@ -231,6 +232,11 @@ int main(void)
         return err;
     }
     k_msleep(500);
+
+    // Needs the card mounted: the boot counter is persisted there for want of an RTC or NVS.
+    rtc_init();
+    // Anchor the offset this session starts at, even though the clock is not yet set.
+    storage_index_mark(true);
 
     LOG_PRINTK("\n");
     LOG_INF("Initializing storage...\n");

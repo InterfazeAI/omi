@@ -10,10 +10,14 @@
         return (result);                                                                                               \
     }
 
+// result must stay parenthesized: without it "ASSERT_TRUE(a == b)" expands to "if (!a == b)",
+// which silently never fires unless b is 0. Evaluated once so a failing call is not repeated.
 #define ASSERT_TRUE(result)                                                                                            \
-    if (!result) {                                                                                                     \
-        LOG_ERR("Error at %s:%d:%d", __FILE__, __LINE__, result);                                                      \
-        return -1;                                                                                                     \
-    }
+    do {                                                                                                               \
+        if (!(result)) {                                                                                               \
+            LOG_ERR("Assertion failed at %s:%d", __FILE__, __LINE__);                                                  \
+            return -1;                                                                                                 \
+        }                                                                                                              \
+    } while (0)
 
 #endif

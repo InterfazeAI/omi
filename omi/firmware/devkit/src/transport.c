@@ -19,15 +19,14 @@
 #include "button.h"
 #include "lib/battery/battery.h"
 #include "mic.h"
+#include "rtc.h"
 #include "sdcard.h"
 #include "speaker.h"
 #include "storage.h"
 // #include "friend.h"
 LOG_MODULE_REGISTER(transport, CONFIG_LOG_DEFAULT_LEVEL);
 
-#define MAX_STORAGE_BYTES 0xFFFF0000
 extern bool is_connected;
-extern bool storage_is_on;
 extern uint8_t file_count;
 extern uint32_t file_num_array[2];
 struct bt_conn *current_connection = NULL;
@@ -114,6 +113,67 @@ static struct bt_gatt_attr audio_service_attr[] = {
 };
 
 static struct bt_gatt_service audio_service = BT_GATT_SERVICE(audio_service_attr);
+
+// Time Sync service with UUID 19B10030-E8F2-537E-4F6C-D104768A1214
+// exposes following characteristics:
+// - Time write (UUID 19B10031-...) accepts 4 bytes of UTC epoch seconds to set the clock
+// - Time read  (UUID 19B10032-...) returns the device's current epoch, 0 if unsynchronized
+// UUIDs deliberately match the newer omi firmware so the existing app can sync this device.
+static struct bt_uuid_128 time_sync_service_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10030, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 time_sync_write_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10031, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 time_sync_read_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10032, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+
+static ssize_t time_sync_write_handler(struct bt_conn *conn,
+                                       const struct bt_gatt_attr *attr,
+                                       const void *buf,
+                                       uint16_t len,
+                                       uint16_t offset,
+                                       uint8_t flags)
+{
+    if (len != sizeof(uint32_t)) {
+        LOG_WRN("Invalid length for time sync write: %u", len);
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
+
+    uint32_t epoch_s;
+    memcpy(&epoch_s, buf, sizeof(epoch_s));
+
+    int err = rtc_set_epoch(epoch_s);
+    if (err) {
+        LOG_ERR("Failed to set clock: %d", err);
+        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    }
+
+    return len;
+}
+
+static ssize_t
+time_sync_read_handler(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
+{
+    uint32_t epoch_s = rtc_get_epoch();
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &epoch_s, sizeof(epoch_s));
+}
+
+static struct bt_gatt_attr time_sync_service_attr[] = {
+    BT_GATT_PRIMARY_SERVICE(&time_sync_service_uuid),
+    BT_GATT_CHARACTERISTIC(&time_sync_write_uuid.uuid,
+                           BT_GATT_CHRC_WRITE,
+                           BT_GATT_PERM_WRITE,
+                           NULL,
+                           time_sync_write_handler,
+                           NULL),
+    BT_GATT_CHARACTERISTIC(&time_sync_read_uuid.uuid,
+                           BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ,
+                           time_sync_read_handler,
+                           NULL,
+                           NULL),
+};
+
+static struct bt_gatt_service time_sync_service = BT_GATT_SERVICE(time_sync_service_attr);
 
 // Nordic Legacy DFU service with UUID 00001530-1212-EFDE-1523-785FEABCD123
 // exposes following characteristics:
@@ -400,7 +460,6 @@ void broadcast_battery_level(struct k_work *work_item)
 static void _transport_connected(struct bt_conn *conn, uint8_t err)
 {
     struct bt_conn_info info = {0};
-    storage_is_on = true;
 
     err = bt_conn_get_info(conn, &info);
     if (err) {
@@ -433,7 +492,6 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
 static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 {
     is_connected = false;
-    storage_is_on = false;
 
     LOG_INF("Transport disconnected");
 
@@ -530,7 +588,8 @@ static bool read_from_tx_queue()
                      tx_buffer,
                      (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)); // It always fits completely or not at all
     if (tx_buffer_size != (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)) {
-        LOG_ERR("Failed to read from ring buffer. not enough data %d", tx_buffer_size);
+        // An empty queue is the normal idle state for the pusher, not an error.
+        LOG_DBG("tx queue empty (%d bytes)", tx_buffer_size);
         return false;
     }
 
@@ -551,13 +610,10 @@ static struct k_thread pusher_thread;
 static uint16_t packet_next_index = 0;
 static uint8_t pusher_temp_data[CODEC_OUTPUT_MAX_BYTES + NET_BUFFER_HEADER_SIZE];
 
+// Sends the frame currently held in tx_buffer. The caller owns the dequeue so the same frame
+// can also be handed to the recorder; this must not pull from the ring buffer itself.
 static bool push_to_gatt(struct bt_conn *conn)
 {
-    // Read data from ring buffer
-    if (!read_from_tx_queue()) {
-        return false;
-    }
-
     // Push each frame
     uint8_t *buffer = tx_buffer + RING_BUFFER_HEADER_SIZE;
     uint32_t offset = 0;
@@ -616,36 +672,10 @@ static bool push_to_gatt(struct bt_conn *conn)
 static uint8_t storage_temp_data[MAX_WRITE_SIZE];
 static uint32_t offset = 0;
 static uint16_t buffer_offset = 0;
-// bool write_to_storage(void)
-// {
-//     if (!read_from_tx_queue())
-//     {
-//         return false;
-//     }
-
-//     uint8_t *buffer = tx_buffer+2;
-//     const uint32_t packet_size = tx_buffer_size;
-//     //load into write at 400 bytes at a time. is faster
-//     memcpy(storage_temp_data + OPUS_PREFIX_LENGTH + buffer_offset, buffer, packet_size);
-//     storage_temp_data[buffer_offset] = (uint8_t)tx_buffer_size;
-
-//     buffer_offset = buffer_offset+OPUS_PADDED_LENGTH;
-//     if(buffer_offset >= OPUS_PADDED_LENGTH*5) {
-//     uint8_t *write_ptr = (uint8_t*)storage_temp_data;
-//     write_to_file(write_ptr,OPUS_PADDED_LENGTH*5);
-
-//     buffer_offset = 0;
-//     }
-
-//     return true;
-// }
-// for improving ble bandwidth
+// Packs the frame currently held in tx_buffer into the 440-byte block and flushes the block to
+// the card when full. Like push_to_gatt(), the caller owns the dequeue.
 bool write_to_storage(void)
 { // max possible packing
-    if (!read_from_tx_queue()) {
-        return false;
-    }
-
     uint8_t *buffer = tx_buffer + 2;
     uint8_t packet_size = (uint8_t) (tx_buffer_size + OPUS_PREFIX_LENGTH);
 
@@ -677,85 +707,68 @@ bool write_to_storage(void)
     return true;
 }
 
-static bool use_storage = true;
-#define MAX_FILES 10
-#define MAX_AUDIO_FILE_SIZE 300000
-static int recent_file_size_updated = 0;
 static uint8_t heartbeat_count = 0;
 void update_file_size()
 {
-    file_num_array[0] = get_file_size(1);
+    file_num_array[0] = storage_get_size();
     file_num_array[1] = get_offset();
-    // LOG_PRINTK("file size for file count %d %d\n",file_count,file_num_array[0]);
-    // LOG_PRINTK("offset for file count %d %d\n",file_count,file_num_array[1]);
 }
+
+// Roughly one second of audio at 100 frames/s.
+#define FILE_SIZE_REFRESH_FRAMES 100
 
 void pusher(void)
 {
     k_msleep(500);
+    static bool connection_was_true = false;
+
     while (1) {
-        //
-        // Load current connection
-        //
         struct bt_conn *conn = current_connection;
-        // updating the most recent file size is expensive!
-        static bool file_size_updated = true;
-        static bool connection_was_true = false;
+
         if (conn && !connection_was_true) {
-            k_msleep(100);
-            file_size_updated = false;
             connection_was_true = true;
+            // Refresh the advertised sizes so a client reading them right after connecting
+            // sees the current recording rather than a stale value.
+            update_file_size();
         } else if (!conn) {
             connection_was_true = false;
         }
-        if (!file_size_updated) {
-            LOG_PRINTK("updating file size\n");
-            update_file_size();
 
-            file_size_updated = true;
-        }
         if (conn) {
             conn = bt_conn_ref(conn);
         }
-        bool valid = true;
-        if (current_mtu < MINIMAL_PACKET_SIZE) {
-            valid = false;
-        } else if (!conn) {
-            valid = false;
-        } else {
-            valid = bt_gatt_is_subscribed(conn, &audio_service.attrs[1], BT_GATT_CCC_NOTIFY); // Check if subscribed
+
+        bool stream = false;
+        if (conn && current_mtu >= MINIMAL_PACKET_SIZE) {
+            stream = bt_gatt_is_subscribed(conn, &audio_service.attrs[1], BT_GATT_CCC_NOTIFY);
         }
 
-        if (!valid && !storage_is_on) {
-            bool result = false;
-            if (file_num_array[1] < MAX_STORAGE_BYTES) {
+        // One dequeue per iteration, fanned out to both sinks. The card records continuously
+        // whether or not a phone is attached, and a subscribed phone still gets live audio.
+        if (read_from_tx_queue()) {
+            if (is_sd_on()) {
                 k_mutex_lock(&write_sdcard_mutex, K_FOREVER);
-                if (is_sd_on()) {
-                    result = write_to_storage();
-                }
+                write_to_storage();
                 k_mutex_unlock(&write_sdcard_mutex);
             }
-            if (result) {
-                heartbeat_count++;
-                if (heartbeat_count == 255) {
-                    update_file_size();
-                    heartbeat_count = 0;
-                    LOG_PRINTK("drawing\n");
-                }
-            } else {
+
+            if (stream) {
+                push_to_gatt(conn);
             }
-        }
-        if (valid) {
-            bool sent = push_to_gatt(conn);
-            if (!sent) {
-                // k_sleep(K_MSEC(50));
+
+            if (++heartbeat_count >= FILE_SIZE_REFRESH_FRAMES) {
+                heartbeat_count = 0;
+                file_num_array[0] = storage_get_size();
             }
+        } else {
+            // Queue drained. Yielding alone spun this thread flat out, which starved the
+            // logger and buried the system in "not enough data" errors.
+            k_sleep(K_MSEC(2));
         }
+
         if (conn) {
             bt_conn_unref(conn);
         }
-
-        k_yield();
     }
 }
 extern struct bt_gatt_service storage_service;
@@ -791,7 +804,6 @@ int bt_off()
 
     // Ensure all Bluetooth resources are cleaned up
     is_connected = false;
-    storage_is_on = false;
     current_mtu = 0;
 
     return 0;
@@ -836,6 +848,7 @@ int transport_start()
     memset(storage_temp_data, 0, OPUS_PADDED_LENGTH * 4);
     bt_gatt_service_register(&storage_service);
     bt_gatt_service_register(&audio_service);
+    bt_gatt_service_register(&time_sync_service);
     bt_gatt_service_register(&dfu_service);
     err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
     if (err) {

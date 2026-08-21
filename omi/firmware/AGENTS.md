@@ -2,6 +2,10 @@
 
 Component guide for `omi/firmware/`. General engineering rules: root `AGENTS.md`.
 
+Working on DevKit v2 SD recording, sync throughput, or the Opus config? Read
+`devkit/DEBUGGING.md` first — it records the SDK bugs, thread-starvation traps and measured
+baselines that make those symptoms diagnosable.
+
 ## Release Workflow
 
 Firmware releases are manual via `.github/workflows/firmware_release.yml`:
