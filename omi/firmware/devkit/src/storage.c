@@ -64,7 +64,7 @@ extern uint32_t file_num_array[2];
 void broadcast_storage_packet(struct k_work *work_item);
 
 // Layout of the storage-info characteristic. See storage_read_characteristic().
-#define STORAGE_INFO_BYTES 34
+#define STORAGE_INFO_BYTES 50
 
 static void put_le32(uint8_t *p, uint32_t v)
 {
@@ -131,6 +131,14 @@ static ssize_t storage_read_characteristic(struct bt_conn *conn,
     put_le32(info + 22, evictions);
     put_le32(info + 26, (uint32_t) last_evict_err);
     put_le32(info + 30, sync_errors);
+
+    uint32_t open_failures = 0, write_failures = 0;
+    int32_t last_open_err = 0, last_write_err = 0;
+    storage_io_stats(&open_failures, &last_open_err, &write_failures, &last_write_err);
+    put_le32(info + 34, open_failures);
+    put_le32(info + 38, (uint32_t) last_open_err);
+    put_le32(info + 42, write_failures);
+    put_le32(info + 46, (uint32_t) last_write_err);
 
     return bt_gatt_attr_read(conn, attr, buf, len, offset, info, sizeof(info));
 }

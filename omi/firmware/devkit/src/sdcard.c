@@ -124,6 +124,15 @@ static uint32_t seg_newest = 1; // mirrors seg_seq[seg_count - 1]; the segment b
 static uint32_t ring_evictions = 0;
 static int32_t ring_last_evict_err = 0;
 
+// Same reasoning for the two operations that carry the recording itself. When a card stops
+// accepting the append, the only symptom a host can see is a byte count that never moves --
+// indistinguishable from a dead microphone without the errno. Read without the mutex on
+// purpose: these matter most when an operation is stuck holding it.
+static uint32_t io_open_failures = 0;
+static uint32_t io_write_failures = 0;
+static int32_t io_last_open_err = 0;
+static int32_t io_last_write_err = 0;
+
 static void seg_refresh_bounds(void)
 {
     if (seg_count == 0) {
@@ -180,6 +189,8 @@ static int storage_open_locked(void)
     fs_file_t_init(&audio_file);
     int rc = fs_open(&audio_file, path, FS_O_WRITE | FS_O_APPEND | FS_O_CREATE);
     if (rc) {
+        io_open_failures++;
+        io_last_open_err = rc;
         LOG_ERR("Failed to open %s for append: %d", path, rc);
         return rc;
     }
@@ -360,6 +371,8 @@ static int write_batch_flush_locked(void)
 
     ssize_t written = fs_write(&audio_file, write_batch, write_batch_len);
     if (written < 0) {
+        io_write_failures++;
+        io_last_write_err = (int32_t) written;
         LOG_ERR("audio write failed: %d", (int) written);
         // The buffered audio is unrecoverable, but keeping it would wedge every later flush
         // behind the same failure. Drop the handle so the next write retries from a clean open.
@@ -835,6 +848,25 @@ void storage_ring_stats(uint32_t *evictions, int32_t *last_evict_err, uint32_t *
         *sync_errors = sync_error_count;
     }
     k_mutex_unlock(&sd_mutex);
+}
+
+void storage_io_stats(uint32_t *open_failures,
+                      int32_t *last_open_err,
+                      uint32_t *write_failures,
+                      int32_t *last_write_err)
+{
+    if (open_failures) {
+        *open_failures = io_open_failures;
+    }
+    if (last_open_err) {
+        *last_open_err = io_last_open_err;
+    }
+    if (write_failures) {
+        *write_failures = io_write_failures;
+    }
+    if (last_write_err) {
+        *last_write_err = io_last_write_err;
+    }
 }
 
 static uint32_t seg_seq_for_num_locked(uint8_t num)

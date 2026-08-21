@@ -51,6 +51,20 @@ uint32_t storage_segment_max_count(void);
 void storage_ring_stats(uint32_t *evictions, int32_t *last_evict_err, uint32_t *sync_errors);
 
 /**
+ * @brief Failure counts and last errno for the two operations that carry the recording.
+ *
+ * A card that stops accepting the append presents to a host as a byte count that never moves,
+ * which looks identical to a dead microphone. These separate the two and name the errno, without
+ * needing the serial console — which on this board stops delivering seconds after boot. Unlike
+ * storage_ring_stats() these take no lock, so they still answer while an operation is wedged
+ * holding the mutex. Any argument may be NULL.
+ */
+void storage_io_stats(uint32_t *open_failures,
+                      int32_t *last_open_err,
+                      uint32_t *write_failures,
+                      int32_t *last_write_err);
+
+/**
  * @brief Commit buffered audio to the card
  *
  * Writes are synced periodically; call this to force a commit, e.g. before a BLE sync so the

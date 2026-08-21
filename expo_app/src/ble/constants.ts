@@ -13,7 +13,7 @@ export const STORAGE_SERVICE_UUID = '30295780-4301-eabd-2904-2849adfeae43';
 /** Commands are written here, and every response and data block notifies back on it. */
 export const STORAGE_CMD_CHAR_UUID = '30295781-4301-eabd-2904-2849adfeae43';
 
-/** Read-only, 21 bytes little-endian. See parseRingInfo. */
+/** Read-only, little-endian, and it grows: the DevKit sends 50 bytes today. See parseRingInfo. */
 export const STORAGE_INFO_CHAR_UUID = '30295782-4301-eabd-2904-2849adfeae43';
 
 export const TIME_SYNC_SERVICE_UUID = '19b10030-e8f2-537e-4f6c-d104768a1214';
@@ -24,7 +24,11 @@ export const TIME_SYNC_WRITE_CHAR_UUID = '19b10031-e8f2-537e-4f6c-d104768a1214';
 /** Size of one storage data block. Offsets must be a multiple of this. */
 export const SD_BLE_SIZE = 440;
 
-/** Length of the storage info characteristic payload. */
+/**
+ * Shortest payload that still carries the ring fields, not the payload's actual length —
+ * the firmware appends diagnostics past this and will keep doing so. Treat it as a minimum,
+ * never as an equality check, or the next field added to the characteristic breaks parsing.
+ */
 export const STORAGE_INFO_BYTES = 21;
 
 export const StorageCommand = {

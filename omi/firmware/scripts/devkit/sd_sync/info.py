@@ -15,6 +15,13 @@ import omi_sd
 BYTES_PER_SECOND = 2391.0
 SYNC_KB_PER_SECOND = 15.0
 
+ERRNO_HINTS = {
+    5: "-EIO: the SD layer gave up on a transfer, usually after a -116 timeout on the bus",
+    116: "-ETIMEDOUT: the card accepted the command but never returned data",
+    2: "-ENOENT: the file or directory is gone",
+    28: "-ENOSPC: the card is full",
+}
+
 
 async def main():
     device = await omi_sd.find_device()
@@ -44,6 +51,19 @@ async def main():
         # fs_sync always fails on SD in this SDK (see DEBUGGING.md trap 1), so a nonzero count
         # is expected; a count that stays at 0 while recording would be the surprise.
         print(f"  sync errors {info.sync_errors:,} (expected nonzero, known SDK bug)")
+    if info.io_healthy:
+        print("  card i/o    no open or write failures")
+    else:
+        print(f"  card i/o    {info.open_failures:,} open failures (last errno "
+              f"{info.last_open_err}), {info.write_failures:,} write failures "
+              f"(last errno {info.last_write_err})")
+        hint = ERRNO_HINTS.get(abs(info.last_open_err or info.last_write_err))
+        if hint:
+            print(f"              {hint}")
+        # Writes failing before opens is the signature of an intermittent chip-select wire, not
+        # a bad card -- it costs a day to rediscover. See DEBUGGING.md trap 10.
+        if info.write_failures:
+            print("              writes failing first: suspect the CS wire before the card")
     print(f"  full sync   ~{total/1024/SYNC_KB_PER_SECOND/60:.1f} min at {SYNC_KB_PER_SECOND:.0f} KB/s\n")
 
 

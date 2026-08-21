@@ -169,6 +169,19 @@ class RingInfo:
             self.max_count = 0
             self.evictions = self.sync_errors = self.last_evict_err = 0
 
+        # A card that stops accepting the append looks exactly like a dead microphone from here:
+        # newest_bytes simply stops moving. These name the failing operation and its errno.
+        if len(raw) >= 50:
+            (self.open_failures, self.last_open_err,
+             self.write_failures, self.last_write_err) = struct.unpack("<IiIi", raw[34:50])
+        else:
+            self.open_failures = self.write_failures = 0
+            self.last_open_err = self.last_write_err = 0
+
+    @property
+    def io_healthy(self):
+        return not (self.open_failures or self.write_failures)
+
     @property
     def total_bytes(self):
         """Approximate total across the ring; only the newest segment's length is exact."""

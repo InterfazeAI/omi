@@ -8,6 +8,9 @@ follows cost hours to find and is not obvious from the code.
 
 - Seeed XIAO nRF52840 Sense, Zephyr target `xiao_ble/nrf52840/sense`.
 - Adafruit MicroSD Card BFF, hand-wired over SPI (not the board the overlay was written for).
+  Chip select runs from the BFF's square CS pad to **D0/A0 (P0.02)**, matching the base overlay.
+  That wire is the single most failure-prone thing on the board and its failure mode looks exactly
+  like a dying SD card — read Trap 10 before debugging any write failure.
 - No speaker fitted; a latching switch in the battery line instead of the momentary button.
   Build with `sd-on-no-button-speaker.conf` so the firmware does not wait on absent hardware.
 - SPI is pinned to 8 MHz in `overlay/xiao_ble_sense_devkitv2-adafruit.overlay`. Dropping from
@@ -200,6 +203,66 @@ pinned down, and why `evictions`, `last eviction errno` and `sync errors` are in
   actually wants. Also, `codec.c` must include `lib/opus-1.2.1/config.h`, or every
   `CONFIG_OPUS_MODE == ...` test compares 0 to 0 and matches all branches at once.
 
+### 10. An intermittent chip-select wire impersonates a dying card
+
+The symptom, in order: the card initializes, the filesystem mounts, and the directory scan finds
+the segments and reports their sizes — all real block reads, all successful. Recording runs
+normally for a while. Then one or two `fs_write` calls fail with `-5`, and from that moment
+**every** `fs_open` fails with `-5` too, indefinitely, while the byte count sits frozen. The
+open failures keep trickling in at roughly four per minute forever.
+
+The cause was a hand-soldered chip-select wire that was mechanically failing. It was only ever
+identified because it finally broke outright.
+
+Reads survive and writes do not because of duration. A read or a command holds CS asserted for a
+few hundred microseconds; a block program holds it through the data token, the payload, and a
+busy-wait the SD spec permits to reach 250 ms. An intermittent joint passes the short transactions
+and glitches the long one, and a card interrupted mid-program hangs until it is power-cycled —
+which is exactly the endless-open-failure tail. The joint beeps fine on a continuity test the
+whole time, because it is only open under flex or thermal movement.
+
+**The false trail matters more than the fault.** Because the failure was intermittent, it
+manufactured convincing evidence for conclusions that were wrong:
+
+- Moving CS from P0.02 to P1.11 appeared to *cause* the failure, and moving it back appeared to
+  *fix* it — complete with a rebuild, a reflash, and a passing 60 s growth test. The pin was
+  innocent. The same failing wire was in both paths, and the "fix" held for three and a half
+  minutes before the identical failure returned.
+- **A 60 s test proves nothing here.** On the run that looked fixed, the failure took ~3.5 minutes
+  to appear. Run at least six minutes with no downloads before believing any card fix.
+
+None of the following changed the symptom, and none are worth repeating:
+
+- Two different microSD cards, each freshly formatted FAT32/MBR and each verified good on a Mac
+  with a 200 MB write-read checksum.
+- SPI at 1 MHz instead of 8 MHz, ruling out timing margin.
+- `WRITE_BATCH_SIZE` cut from 8192 to 512 so every write is a single sector, ruling out
+  multi-block CMD25.
+- Three reformats, the card reseated, the battery and switch removed to run on USB alone, and the
+  3V/GND joints reflowed. The BFF's 3V pad measured a solid 3.3 V throughout.
+- Two chip-select routings, with a separate firmware build for each.
+
+So when writes fail while reads work, **prove the CS wire mechanically before changing anything in
+software.** Wiggle it while recording and watch the byte counter stall, or simply reflow the joint
+and add strain relief. Then confirm with a six-minute no-download run.
+
+Two BFF wiring facts, because each generated its own dead end:
+
+- On the BFF the **TX pad and the square CS pad are the same net** — a factory jumper ties them.
+  Swapping between the two is not a variable; both are places to grab the same signal.
+- The **A0 pad is not chip select** unless its solder jumper is bridged. Wiring XIAO D0 to the
+  BFF's A0 pad leaves CS floating, which presents differently: `CMD0` times out, the mount fails,
+  and because a failed mount stops BLE (Trap 9) the board looks dead in a watchdog reboot loop.
+
+This was only diagnosable because the open and write failure counts and their errnos are published
+on the storage-info characteristic — Trap 8 again. Serial gave nothing. Without counters that
+separate opens from writes, the "writes fail first, then opens fail forever" ordering is invisible,
+and that ordering is the whole signature.
+
+Healthy baseline after the joint was repaired, for comparison: six minutes of recording at
+2.77 KB/s with zero I/O failures, then a 366 KB pull at 13.7 KB/s producing 13,191 frames with no
+decode errors, with the counters still at zero afterwards and recording uninterrupted throughout.
+
 ## Measured Baselines
 
 Use these to tell "slow" from "broken" without re-deriving them.
@@ -293,7 +356,7 @@ segment, so the index cannot outgrow the ring. `/SD:/info.txt` holds the read of
 | Storage size (read) | `30295782-4301-eabd-2904-2849adfeae43` |
 | Time sync | `19b10030-e8f2-537e-4f6c-d104768a1214` |
 
-The size characteristic returns 21 bytes describing the ring. The first two words keep their
+The size characteristic returns 50 bytes describing the ring. The first two words keep their
 original meaning so a client that reads only 8 bytes still works:
 
 | Offset | Type | Meaning |
@@ -308,6 +371,15 @@ original meaning so a client that reads only 8 bytes still works:
 | 22 | `u32` | successful evictions since boot |
 | 26 | `i32` | errno of the last failed eviction, 0 if none |
 | 30 | `u32` | `fs_sync` failures — expected nonzero, see Trap 1 |
+| 34 | `u32` | `fs_open` failures — unlike sync, any nonzero value is a real fault |
+| 38 | `i32` | errno of the last failed open, 0 if none |
+| 42 | `u32` | `fs_write` failures |
+| 46 | `i32` | errno of the last failed write, 0 if none |
+
+The open and write counters are the pair that make a genuinely broken card distinguishable from
+the SDK bug in Trap 1, and their ordering is diagnostic in itself: writes failing first and opens
+failing afterwards is the signature in Trap 10. `info.py` prints them with a hint for the common
+errnos (`-5`, `-116`, `-2`, `-28`).
 
 Commands are six bytes, `[cmd, file_no, off>>24, off>>16, off>>8, off]`, with
 `READ=0, DELETE=1, NUKE=2, STOP=3`. A single byte `100` notified back marks end of transfer.
@@ -364,10 +436,10 @@ them.
   would not reclaim the space either; that would need frames to span blocks, which breaks the
   "each block parses independently" contract both paths rely on.
 - The Zephyr `card_ioctl` fall-through is worked around, not fixed upstream.
-- `sync_error_count` is now published on the storage-info characteristic and shown by `info.py`,
-  so a genuinely failing card is no longer completely indistinguishable from the SDK bug — but
-  only by rate, since the bug makes every sync "fail". A real fault still needs `fs_write`
-  errors to confirm it.
+- `sync_error_count` on its own still cannot tell a failing card from the SDK bug in Trap 1, since
+  that bug makes every sync "fail" — only the rate differs. The confirming signal it needed now
+  exists alongside it: the `fs_open` and `fs_write` counters on the same characteristic, which the
+  SDK bug never touches.
 - Dead code in `transport.c`: the file-scope `static uint32_t offset` is never read or written,
   and the init `memset(storage_temp_data, 0, OPUS_PADDED_LENGTH * 4)` clears 320 bytes of a
   440-byte buffer. Harmless (statics are zero-initialized) but it reads like tail-clearing that

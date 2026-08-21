@@ -47,6 +47,18 @@ test('decodes the 21-byte info characteristic as little-endian', () => {
   assert.deepEqual(info, SAMPLE);
 });
 
+test('ignores diagnostic fields the firmware appends after the ring block', () => {
+  // The DevKit grew this characteristic from 34 to 50 bytes to publish SD open/write failure
+  // counts. Parsing must key off a minimum length, never an exact one, or every future field
+  // added there silently breaks sync.
+  const bytes = new Uint8Array(50);
+  bytes.set(infoBytes(SAMPLE), 0);
+  new DataView(bytes.buffer).setUint32(34, 12, true); // open failures
+  new DataView(bytes.buffer).setInt32(38, -5, true); // last open errno
+
+  assert.deepEqual(parseRingInfo(bytes), SAMPLE);
+});
+
 test('treats an 8-byte reply from pre-ring firmware as a single segment', () => {
   const bytes = new Uint8Array(8);
   new DataView(bytes.buffer).setUint32(0, 1234, true);
