@@ -21,6 +21,27 @@ export const TIME_SYNC_SERVICE_UUID = '19b10030-e8f2-537e-4f6c-d104768a1214';
 /** Write exactly 4 bytes, UTC epoch seconds, little-endian. */
 export const TIME_SYNC_WRITE_CHAR_UUID = '19b10031-e8f2-537e-4f6c-d104768a1214';
 
+/**
+ * Pairing service. Present on every build; its status characteristic reports whether this
+ * particular build actually encrypts anything. See src/ble/pairing.ts.
+ */
+export const PAIRING_SERVICE_UUID = '19b10040-e8f2-537e-4f6c-d104768a1214';
+
+/** Read, and deliberately never encrypted, so it can explain why pairing failed. */
+export const PAIRING_STATUS_CHAR_UUID = '19b10041-e8f2-537e-4f6c-d104768a1214';
+
+/** Write, encrypted: only the current owner may hand the device to someone else. */
+export const PAIRING_RELEASE_CHAR_UUID = '19b10042-e8f2-537e-4f6c-d104768a1214';
+
+/** Minimum payload of the pairing status characteristic. Treat as a floor, as with the ring info. */
+export const PAIRING_STATUS_BYTES = 25;
+
+/**
+ * The exact bytes the release characteristic accepts. The encrypted link already proves ownership;
+ * the magic is there so a stray or truncated write cannot throw the bond away by accident.
+ */
+export const UNBOND_MAGIC = 'OMIUNBND';
+
 /** Size of one storage data block. Offsets must be a multiple of this. */
 export const SD_BLE_SIZE = 440;
 

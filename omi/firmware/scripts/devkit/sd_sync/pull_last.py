@@ -11,39 +11,15 @@ timestamp index instead, which records the byte offset reached every 30 s.
 import argparse
 import asyncio
 import os
-import struct
 import sys
 import time
 
 from bleak import BleakClient
 
 import omi_sd
+from omi_sd import INDEX_INTERVAL_S, fetch_index, timeline, wall_clock_at
 
-INDEX_RECORD = 16
-INDEX_INTERVAL_S = 30
 READ_TO_EOF = omi_sd.READ_TO_EOF
-
-
-def parse_index(raw):
-    """Records as (offset, epoch, uptime, boot_id), oldest first."""
-    usable = len(raw) - (len(raw) % INDEX_RECORD)
-    return [struct.unpack("<IIII", raw[i:i + INDEX_RECORD])
-            for i in range(0, usable, INDEX_RECORD)]
-
-
-def timeline(records):
-    """Recorded-audio seconds elapsed at each mark, counting from the first.
-
-    Elapsed time comes from the uptime column and is only meaningful within one boot, since a
-    reset restarts it at zero — but a reset costs no audio either, because the file is simply
-    appended to again when the device comes back. So a boot boundary contributes nothing and
-    the walk continues through it.
-    """
-    marks = [0.0]
-    for i in range(1, len(records)):
-        step = records[i][2] - records[i - 1][2] if records[i][3] == records[i - 1][3] else 0
-        marks.append(marks[-1] + max(step, 0))
-    return marks
 
 
 def mark_before(records, marks, seconds_back):
@@ -59,20 +35,6 @@ def mark_before(records, marks, seconds_back):
     return 0
 
 
-def wall_clock_at(records, marks, position):
-    """Epoch seconds at a mark, or None if no reachable mark carries a date.
-
-    Marks store epoch 0 until an app sets the clock (see set_time.py), so the date is recovered
-    by taking the most recent dated mark and stepping back along the recorded timeline. Time
-    spent rebooting is not in that timeline, so a window reaching back through a reset reads
-    later than it truly was, by roughly the downtime.
-    """
-    anchor = next((i for i in range(len(records) - 1, -1, -1) if records[i][1] != 0), None)
-    if anchor is None:
-        return None
-    return records[anchor][1] + (marks[position] - marks[anchor])
-
-
 def resolve_out_path(out, start_epoch):
     """Turn a directory (or nothing) into a filename stamped with the recording's start."""
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(start_epoch))
@@ -81,11 +43,6 @@ def resolve_out_path(out, start_epoch):
     if os.path.isdir(out):
         return os.path.join(out, f"omi-{stamp}.wav")
     return out
-
-
-async def fetch_index(client, segment):
-    raw, _ = await omi_sd.download(client, 0, READ_TO_EOF, segment=segment, want_index=True)
-    return parse_index(raw)
 
 
 async def run(minutes, out):

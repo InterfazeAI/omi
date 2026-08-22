@@ -46,6 +46,9 @@ Run from this directory (the scripts import `omi_sd` as a sibling).
 # Segments on the card, retention, and how long a full sync would take
 python3 info.py
 
+# Pull everything on the card. Hours long, so it is resumable -- see below.
+python3 pull_all.py ~/Desktop/omi-archive
+
 # Pull back the last N minutes of recorded audio, joining segments if the window
 # crosses a rotation. Uses the on-card timestamp index, so it stays correct
 # under VBR, where a quiet hour occupies far fewer bytes than a loud one.
@@ -93,6 +96,39 @@ Two things that will look like bugs and are not:
   has no stale bond.
 - If the bonded device is lost or broken it can never ask for the release, so the bond slot stays
   occupied. That is what `omi_build_unbond.sh` is for, and it clears the bond only, not the card.
+
+## Pulling the whole card
+
+`pull_all.py` is the only tool here built on the assumption that it will not finish in one go. A
+full card is ~120 MB at ~17 KB/s, which is over two hours; connections drop and laptops sleep.
+
+```bash
+python3 pull_all.py ~/Desktop/omi-archive     # start, or resume
+python3 pull_all.py ~/Desktop/omi-archive --decode-only    # re-decode, no device needed
+```
+
+Interrupt it however you like — Ctrl-C, a dropped link, `kill -9` — and run the same command
+again. It reconnects by itself while running, and on a fresh start it continues from the last
+440-byte block it wrote.
+
+**The part files are the progress record, not `pull-state.json`.** Bytes reach the disk about once
+a second; the state file is rewritten once per segment. So the resume point is the length of
+`seg-NNNN.opus`, truncated down to a block boundary, and the state file only says which segments
+were asked for. Nothing is re-fetched because the two disagreed, and a half-written state file
+cannot strand a finished transfer.
+
+The pull is fixed at a **cutoff** taken when it starts: everything recorded before that instant and
+nothing after. Without it the target would run away, because the device keeps recording while you
+read. Resuming keeps the original cutoff.
+
+Output is one WAV per segment plus the raw `.opus` captures, which are kept — they are the
+expensive part, and re-decoding is seconds of local work. Budget for both: audio decodes to about
+115 MB per hour, so a full card is a few GB of WAV against ~120 MB of capture.
+
+Files are named for when the audio was recorded. If the device clock was never set (it resets on
+every power cycle — `set_time.py` fixes it) the times are reconstructed backwards from the cutoff
+using each segment's decoded length. That chain ignores time spent powered off, so segments before
+a shutdown read late by the length of the gap; the tool says so when it has done this.
 
 ## Reading the output
 

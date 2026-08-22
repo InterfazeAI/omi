@@ -9,6 +9,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { State as BluetoothState, type Subscription } from 'react-native-ble-plx';
 
 import { bleManager, OmiClient, scanForDevices, type DiscoveredDevice } from './omiDevice';
+import { diagnosePairing, type PairingStatus, type PairingVerdict } from './pairing';
 import type { RingInfo } from './protocol';
 
 /**
@@ -27,11 +28,35 @@ export type ConnectionStatus =
   | 'scanning'
   | 'available'
   | 'connecting'
+  /** Waiting for the iOS pairing prompt to be accepted. */
+  | 'pairing'
   | 'connected'
   | 'disconnecting';
 
 export interface AvailableDevice extends DiscoveredDevice {
   lastSeenAt: number;
+}
+
+/** Whether the link still has to be encrypted before anything on the device can be read. */
+function needsEncrypting(verdict: PairingVerdict): boolean {
+  return verdict !== 'ready' && verdict !== 'not-required';
+}
+
+/**
+ * Thrown when the link could not be encrypted. Carries the device's own account of why, because
+ * the remedies are opposites: a stale bond is cleared on the phone, a taken slot on the device.
+ */
+class PairingRequiredError extends Error {
+  readonly verdict: PairingVerdict;
+
+  readonly status: PairingStatus;
+
+  constructor(verdict: PairingVerdict, status: PairingStatus) {
+    super(`pairing required: ${verdict}`);
+    this.name = 'PairingRequiredError';
+    this.verdict = verdict;
+    this.status = status;
+  }
 }
 
 export interface ConnectionState {
@@ -42,6 +67,9 @@ export interface ConnectionState {
   mtu: number | null;
   error: string | null;
   clockSynced: boolean;
+  /** Null on firmware with no pairing service, which encrypts nothing. */
+  pairing: PairingStatus | null;
+  pairingVerdict: PairingVerdict | null;
 }
 
 export interface OmiConnection extends ConnectionState {
@@ -51,6 +79,8 @@ export interface OmiConnection extends ConnectionState {
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   refreshInfo: () => Promise<void>;
+  /** Gives up the bond so another phone can pair. Erases the device's recordings. */
+  releaseBond: () => Promise<void>;
   /** Registered by the screen so a disconnect can stop an in-flight sync first. */
   setBeforeDisconnect: (handler: (() => Promise<void>) | null) => void;
 }
@@ -64,12 +94,16 @@ export function useOmiConnection(): OmiConnection {
     mtu: null,
     error: null,
     clockSynced: false,
+    pairing: null,
+    pairingVerdict: null,
   });
 
   const clientRef = useRef<OmiClient | null>(null);
   const disconnectSubscription = useRef<Subscription | null>(null);
   const stopScanRef = useRef<(() => void) | null>(null);
   const beforeDisconnect = useRef<(() => Promise<void>) | null>(null);
+  /** Set while a bond release is in flight, so the drop it causes is explained, not reported. */
+  const releasing = useRef(false);
   const lastSeenRef = useRef<number>(0);
   const mounted = useRef(true);
 
@@ -93,7 +127,11 @@ export function useOmiConnection(): OmiConnection {
         lastSeenRef.current = Date.now();
         setState((current) => {
           // A connected peripheral stops advertising, so ignore stragglers.
-          if (current.status === 'connected' || current.status === 'connecting') {
+          if (
+            current.status === 'connected' ||
+            current.status === 'connecting' ||
+            current.status === 'pairing'
+          ) {
             return current;
           }
           // Advertisements arrive several times a second. Re-rendering on each
@@ -134,6 +172,7 @@ export function useOmiConnection(): OmiConnection {
         setState((current) =>
           current.status === 'connected' ||
           current.status === 'connecting' ||
+          current.status === 'pairing' ||
           current.status === 'disconnecting'
             ? current
             : { ...current, status: 'scanning', error: null },
@@ -189,8 +228,14 @@ export function useOmiConnection(): OmiConnection {
       info: null,
       mtu: null,
       clockSynced: false,
-      error: 'The device disconnected',
+      pairing: null,
+      // A released device is unpaired from its side only; this phone still holds the key, so
+      // the very next connect will fail until iOS is told to forget it. Say so now, while the
+      // user still remembers asking for it.
+      pairingVerdict: releasing.current ? 'stale-bond' : null,
+      error: releasing.current ? null : 'The device disconnected',
     });
+    releasing.current = false;
     startScan();
   }, [patch, startScan]);
 
@@ -200,6 +245,9 @@ export function useOmiConnection(): OmiConnection {
       return;
     }
 
+    // Only the drop caused by the release it was set for may consume this; a release that never
+    // dropped must not colour an unrelated disconnect much later.
+    releasing.current = false;
     patch({ status: 'connecting', error: null });
     // iOS will not deliver connection callbacks reliably while a scan with
     // duplicates is running, and we do not need discovery once we have a target.
@@ -211,6 +259,24 @@ export function useOmiConnection(): OmiConnection {
 
       disconnectSubscription.current = client.onDisconnected(handleUnexpectedDrop);
 
+      // Always safe to read, encrypted or not, and it is the only thing that can explain a
+      // pairing failure -- so read it before anything that pairing could block.
+      let pairing = await client.readPairingStatus();
+
+      const initialVerdict = pairing ? diagnosePairing(pairing) : null;
+      if (pairing && initialVerdict && needsEncrypting(initialVerdict)) {
+        patch({ status: 'pairing', pairing, pairingVerdict: initialVerdict });
+        await client.establishEncryption();
+        // Re-read rather than assume: the reason code the device recorded is the only reliable
+        // account of what just happened, and it is what tells a stale bond from a taken slot.
+        pairing = (await client.readPairingStatus()) ?? pairing;
+      }
+
+      const verdict = pairing ? diagnosePairing(pairing) : null;
+      if (pairing && verdict && needsEncrypting(verdict)) {
+        throw new PairingRequiredError(verdict, pairing);
+      }
+
       const clockSynced = await client.syncClock();
       const info = await client.readInfo();
 
@@ -220,16 +286,29 @@ export function useOmiConnection(): OmiConnection {
         info,
         mtu: client.mtu,
         clockSynced,
+        pairing,
+        pairingVerdict: verdict,
         error: null,
       });
     } catch (error) {
+      const failed = clientRef.current;
       clientRef.current = null;
       disconnectSubscription.current?.remove();
       disconnectSubscription.current = null;
+      // The link is up whenever the failure came after connect(), and leaving it up would keep
+      // the device out of its advertising state, so nothing could ever find it again.
+      await failed?.disconnect().catch(() => {});
+
+      const failure = error instanceof PairingRequiredError ? error : null;
+      const verdict = failure?.verdict ?? null;
       patch({
         status: 'scanning',
         client: null,
-        error: error instanceof Error ? error.message : String(error),
+        pairing: failure?.status ?? null,
+        pairingVerdict: verdict,
+        // A pairing verdict is explained in full by the UI; a bare "Insufficient Encryption"
+        // on top of it would only be noise.
+        error: verdict ? null : error instanceof Error ? error.message : String(error),
       });
       startScan();
     }
@@ -265,10 +344,38 @@ export function useOmiConnection(): OmiConnection {
       info: null,
       mtu: null,
       clockSynced: false,
+      pairing: null,
+      pairingVerdict: null,
       error: null,
     });
     startScan();
   }, [patch, startScan]);
+
+  /**
+   * Hands the device over. The firmware erases the card before releasing the bond and then drops
+   * the link, so the disconnect handler does the cleanup and there is nothing to await.
+   */
+  const releaseBond = useCallback(async () => {
+    const client = clientRef.current;
+    if (!client) {
+      return;
+    }
+    try {
+      await beforeDisconnect.current?.();
+    } catch {
+      // A sync that will not stop must not block the release.
+    }
+    releasing.current = true;
+    try {
+      await client.releaseBond();
+      // The write only asks. The device still has to erase the card before it unpairs and drops
+      // the link, and that takes long enough that the screen must not keep saying "Connected".
+      patch({ status: 'disconnecting', error: null });
+    } catch (error) {
+      releasing.current = false;
+      patch({ error: error instanceof Error ? error.message : String(error) });
+    }
+  }, [patch]);
 
   const refreshInfo = useCallback(async () => {
     const client = clientRef.current;
@@ -290,10 +397,14 @@ export function useOmiConnection(): OmiConnection {
     ...state,
     canConnect: state.status === 'available',
     canDisconnect: state.status === 'connected',
-    busy: state.status === 'connecting' || state.status === 'disconnecting',
+    busy:
+      state.status === 'connecting' ||
+      state.status === 'pairing' ||
+      state.status === 'disconnecting',
     connect,
     disconnect,
     refreshInfo,
+    releaseBond,
     setBeforeDisconnect,
   };
 }

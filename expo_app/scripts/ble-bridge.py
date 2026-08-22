@@ -9,10 +9,12 @@ same code that runs on the phone.
 Protocol, one JSON object per line each way:
 
     in   {"op": "info",  "id": N}      read the 21-byte storage info
+         {"op": "pairing", "id": N}    read the pairing status, which never needs encryption
          {"op": "write", "id": N, "data": "<base64>"}
          {"op": "quit"}
     out  {"t": "ready",   "address": "...", "mtu": N}
          {"t": "info",    "id": N, "data": "<base64>"}
+         {"t": "pairing", "id": N, "data": "<base64>"}
          {"t": "written", "id": N}
          {"t": "notify",  "data": "<base64>"}
          {"t": "error",   "id": N|null, "message": "..."}
@@ -32,6 +34,7 @@ from bleak import BleakClient, BleakScanner
 AUDIO_SVC = "19b10000-e8f2-537e-4f6c-d104768a1214"
 CMD_CHAR = "30295781-4301-eabd-2904-2849adfeae43"
 SIZE_CHAR = "30295782-4301-eabd-2904-2849adfeae43"
+PAIRING_STATUS_CHAR = "19b10041-e8f2-537e-4f6c-d104768a1214"
 
 
 def emit(**payload):
@@ -93,6 +96,9 @@ async def main():
                 if op == "info":
                     raw = await client.read_gatt_char(SIZE_CHAR)
                     emit(t="info", id=request_id, data=base64.b64encode(bytes(raw)).decode())
+                elif op == "pairing":
+                    raw = await client.read_gatt_char(PAIRING_STATUS_CHAR)
+                    emit(t="pairing", id=request_id, data=base64.b64encode(bytes(raw)).decode())
                 elif op == "write":
                     await client.write_gatt_char(
                         CMD_CHAR, base64.b64decode(request["data"]), response=True

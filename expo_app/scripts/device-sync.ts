@@ -27,6 +27,12 @@ import { muxOggOpus } from '../src/audio/oggOpus';
 import { framesToSeconds, parseOpusFrames } from '../src/audio/opusFrames';
 import { SD_BLE_SIZE, StorageCommand, describeStatus } from '../src/ble/constants';
 import {
+  describeSecurityError,
+  diagnosePairing,
+  parsePairingStatus,
+  type PairingStatus,
+} from '../src/ble/pairing';
+import {
   encodeCommand,
   parseRingInfo,
   totalRingBytes,
@@ -159,7 +165,7 @@ class BridgeClient implements SyncClient {
 
     if (event.t === 'error') {
       waiter.reject(new Error(String(event.message)));
-    } else if (event.t === 'info') {
+    } else if (event.t === 'info' || event.t === 'pairing') {
       waiter.resolve(Uint8Array.from(Buffer.from(String(event.data), 'base64')));
     } else {
       waiter.resolve(new Uint8Array(0));
@@ -177,6 +183,15 @@ class BridgeClient implements SyncClient {
 
   async readInfo(): Promise<RingInfo> {
     return parseRingInfo(await this.request({ op: 'info' }));
+  }
+
+  async readPairingStatus(): Promise<PairingStatus | null> {
+    try {
+      return parsePairingStatus(await this.request({ op: 'pairing' }));
+    } catch {
+      // Firmware without the pairing service encrypts nothing, so there is nothing to report.
+      return null;
+    }
   }
 
   subscribe(onNotification: (notification: StorageNotification) => void): void {
@@ -335,6 +350,26 @@ async function main(): Promise<number> {
   const client = await BridgeClient.open(args.python);
   client.trace = args.trace;
   console.log(`Connected to ${client.id}, ATT MTU ${client.mtu}`);
+
+  // Same order the app uses: the status read never needs encryption, so it is the one thing that
+  // still answers when the link is not paired, and it says why.
+  const pairing = await client.readPairingStatus();
+  if (pairing) {
+    const verdict = diagnosePairing(pairing);
+    console.log(
+      `  pairing: ${verdict} (SMP ${pairing.smpEnabled ? 'on' : 'off'}, ` +
+        `${pairing.bondCount}/${pairing.maxBonds} slots, link ` +
+        `${pairing.linkEncrypted ? 'encrypted' : 'clear'})`,
+    );
+    if (pairing.lastSecurityError !== 0) {
+      console.log(`  last security error: ${describeSecurityError(pairing.lastSecurityError)}`);
+    }
+    if (verdict !== 'ready' && verdict !== 'not-required') {
+      // macOS pairs on demand when an encrypted read is attempted, exactly as iOS does, so the
+      // useful thing here is to say which remedy applies rather than to retry blindly.
+      console.log('  the link is not encrypted; the encrypted reads below will fail');
+    }
+  }
 
   const info = await client.readInfo();
   console.log(`  ${describeRing(info)}`);

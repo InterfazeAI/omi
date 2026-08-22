@@ -3,6 +3,7 @@ import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-nati
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { REQUIRED_MTU } from '../src/ble/omiDevice';
+import { describeSecurityError } from '../src/ble/pairing';
 import { totalRingBytes } from '../src/ble/protocol';
 import { useOmiConnection } from '../src/ble/useOmiConnection';
 import { ChunkPlayer, type PlayerState } from '../src/audio/player';
@@ -66,7 +67,7 @@ export default function HomeScreen() {
     return () => setBeforeDisconnect(null);
   }, [setBeforeDisconnect]);
 
-  const { client, refreshInfo } = connection;
+  const { client, refreshInfo, releaseBond } = connection;
   const { reload: reloadRecordings } = recordings;
 
   const startSync = useCallback(async () => {
@@ -130,6 +131,38 @@ export default function HomeScreen() {
     );
   }, [recordings]);
 
+  // Two prompts rather than one: this erases the card, and the firmware wipes before it unpairs
+  // precisely so a new owner cannot inherit the audio. A single tap next to Disconnect is not
+  // enough friction for something no amount of re-pairing undoes.
+  const confirmRelease = useCallback(() => {
+    Alert.alert(
+      'Hand this device to someone else?',
+      'The DevKit erases every recording on its card before it gives up the pairing, so a new owner cannot read your audio. Sync anything you want to keep first.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          style: 'destructive',
+          onPress: () =>
+            Alert.alert(
+              'Erase the card and unpair?',
+              'This cannot be undone. Downloads already on this phone are kept.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Erase and unpair',
+                  style: 'destructive',
+                  onPress: () => {
+                    void releaseBond();
+                  },
+                },
+              ],
+            ),
+        },
+      ],
+    );
+  }, [releaseBond]);
+
   const deviceSummary = useMemo(() => {
     const info = connection.info;
     if (!info) {
@@ -178,13 +211,21 @@ export default function HomeScreen() {
                 void connection.connect();
               }}
               disabled={!connection.canConnect}
-              busy={connection.status === 'connecting'}
+              busy={connection.status === 'connecting' || connection.status === 'pairing'}
               style={styles.grow}
             />
           )}
         </View>
 
         {connection.error ? <Hint tone="danger">{connection.error}</Hint> : null}
+
+        <PairingHint connection={connection} />
+
+        {connection.pairing?.linkEncrypted && connection.status === 'connected' ? (
+          <Pressable onPress={confirmRelease} accessibilityRole="button">
+            <Text style={styles.releaseLabel}>Unpair and hand device over</Text>
+          </Pressable>
+        ) : null}
 
         {connection.status === 'bluetooth-off' ? (
           <Hint tone="warning">Bluetooth is off. Turn it on to find your device.</Hint>
@@ -313,10 +354,33 @@ export default function HomeScreen() {
   );
 }
 
-function connectLabel(status: ReturnType<typeof useOmiConnection>['status']): string {
+type Status = ReturnType<typeof useOmiConnection>['status'];
+
+function idleStatusLabel(status: Status): string {
+  switch (status) {
+    case 'bluetooth-off':
+      return 'Bluetooth off';
+    case 'unauthorised':
+      return 'Bluetooth not permitted';
+    case 'unsupported':
+      return 'No Bluetooth LE radio';
+    case 'pairing':
+      return 'Waiting for pairing';
+    case 'connecting':
+      return 'Connecting';
+    case 'disconnecting':
+      return 'Disconnecting';
+    default:
+      return 'Out of range';
+  }
+}
+
+function connectLabel(status: Status): string {
   switch (status) {
     case 'available':
       return 'Connect';
+    case 'pairing':
+      return 'Pairing';
     case 'bluetooth-off':
       return 'Bluetooth off';
     case 'unauthorised':
@@ -328,14 +392,79 @@ function connectLabel(status: ReturnType<typeof useOmiConnection>['status']): st
   }
 }
 
+/**
+ * The device knows why pairing failed and says so; this only has to route that to the right
+ * remedy. Getting it wrong is worse than saying nothing, because a stale bond is cleared in iOS
+ * Settings and a taken slot can only be cleared on the device -- following the wrong one just
+ * wastes the user's time and leaves them no better informed.
+ */
+function PairingHint({ connection }: { connection: ReturnType<typeof useOmiConnection> }) {
+  const { status, pairing, pairingVerdict } = connection;
+
+  if (status === 'pairing') {
+    return (
+      <Hint>
+        Accept the pairing request on this iPhone. The DevKit keeps its recordings encrypted and
+        will not open them to an unpaired phone.
+      </Hint>
+    );
+  }
+
+  if (!pairingVerdict || pairingVerdict === 'ready' || pairingVerdict === 'not-required') {
+    return null;
+  }
+
+  if (pairingVerdict === 'stale-bond') {
+    return (
+      <Hint tone="warning">
+        This iPhone is still holding a pairing the device has thrown away, so it cannot connect.
+        Open Settings, Bluetooth, tap the info button next to{' '}
+        {connection.device?.name ?? 'the DevKit'} and choose Forget This Device, then connect
+        again.
+      </Hint>
+    );
+  }
+
+  if (pairingVerdict === 'slot-taken') {
+    return (
+      <Hint tone="warning">
+        The DevKit holds one pairing at a time and it belongs to another device. Only that device
+        can give it up, using its own unpair action, and doing so erases the recordings on the
+        card. If it is gone for good, the DevKit has to be reflashed with the unbond image.
+      </Hint>
+    );
+  }
+
+  return (
+    <Hint tone="warning">
+      Pairing did not complete. Tap Connect and accept the request on this iPhone.
+      {pairing && pairing.lastSecurityError !== 0
+        ? ` The device reported: ${describeSecurityError(pairing.lastSecurityError)}.`
+        : ''}
+    </Hint>
+  );
+}
+
 function DeviceStatus({ connection }: { connection: ReturnType<typeof useOmiConnection> }) {
   const { status, device } = connection;
 
   if (status === 'connected') {
+    const pairing = connection.pairing;
     return (
       <>
         <Row label="Status" value="Connected" />
         <Row label="Name" value={connection.client?.name ?? 'Omi DevKit'} />
+        {pairing?.smpEnabled ? (
+          <Row
+            label="Pairing"
+            value={
+              pairing.linkEncrypted
+                ? `Paired · ${pairing.bondCount} of ${pairing.maxBonds} slot${pairing.maxBonds === 1 ? '' : 's'}`
+                : 'Not encrypted'
+            }
+            tone={pairing.linkEncrypted ? undefined : 'warning'}
+          />
+        ) : null}
         {connection.mtu ? <Row label="MTU" value={String(connection.mtu)} tone="muted" /> : null}
       </>
     );
@@ -360,19 +489,7 @@ function DeviceStatus({ connection }: { connection: ReturnType<typeof useOmiConn
     <View style={styles.availabilityRow}>
       <View style={styles.availability}>
         <StatusDot active={false} />
-        <Text style={styles.deviceNameMuted}>
-          {status === 'bluetooth-off'
-            ? 'Bluetooth off'
-            : status === 'unauthorised'
-              ? 'Bluetooth not permitted'
-              : status === 'unsupported'
-                ? 'No Bluetooth LE radio'
-                : status === 'connecting'
-                  ? 'Connecting'
-                  : status === 'disconnecting'
-                    ? 'Disconnecting'
-                    : 'Out of range'}
-        </Text>
+        <Text style={styles.deviceNameMuted}>{idleStatusLabel(status)}</Text>
       </View>
     </View>
   );
@@ -528,6 +645,12 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     fontSize: 13,
     fontWeight: '600',
+  },
+  releaseLabel: {
+    color: colors.danger,
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: spacing.sm,
   },
   list: {
     marginTop: spacing.md,

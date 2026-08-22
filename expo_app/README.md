@@ -20,10 +20,13 @@ npm install
 npx expo run:ios --device        # pick your iPhone when prompted
 ```
 
-Then: **Connect** → **Sync new audio** → tap a recording to play it.
+Then: **Connect** → accept the iOS pairing prompt → **Sync new audio** → tap a recording to play it.
 
 Nothing connects on its own. The app scans in the background and shows whether the DevKit is in
 range; connecting and disconnecting are always your call.
+
+Firmware built with `secure-pairing.conf` keeps its recordings behind a paired link and bonds to one
+device at a time — see [Pairing](#pairing) for what the app does when that bond is somewhere else.
 
 ## How the device protocol works
 
@@ -46,6 +49,38 @@ segment | 0x80  -> read that segment's 16-byte timestamp index instead of its au
 Replies are demultiplexed purely by length: a one-byte notification is a status code (`0` ok,
 `3` bad segment, `4` empty, `5` past EOF, `6` bad command, `100` end of transfer, `200` deleted).
 Anything longer is raw file data. There is no header, sequence number, or checksum.
+
+## Pairing
+
+The firmware can require an encrypted link (`secure-pairing.conf`). In that build everything that
+carries content — the recordings, the audio stream, the clock, DFU — is unreachable until the phone
+has paired, and the board holds **exactly one bond at a time**.
+
+One characteristic is deliberately exempt: the pairing status, `19b10041-…`, is readable on an
+unencrypted link because it exists to explain why pairing failed. The app reads it immediately after
+connecting, before anything pairing could block, and it is also how the app knows whether this
+particular build encrypts anything at all — older firmware has no pairing service, and the app
+treats that as nothing to pair.
+
+There is no CoreBluetooth API to ask iOS to pair. Touching an encrypted characteristic is the
+trigger: the device refuses, and iOS raises its prompt in response. So `establishEncryption()`
+retries the read that pairing would make succeed until it does, or until the device's 30 s SMP
+window closes.
+
+The two ways to be locked out look almost identical from the phone and have opposite remedies, so
+the app never guesses — it routes on the reason code the device recorded (`diagnosePairing`):
+
+| Verdict | What happened | Where the user fixes it |
+|---|---|---|
+| `stale-bond` | The phone holds a key the device threw away (`PinOrKeyMissing`, no bond on the device) | Settings → Bluetooth → Forget This Device |
+| `slot-taken` | The single bond belongs to another device | Unpair from that device, or flash the unbond image |
+| `needs-pairing` | A slot is free | Accept the iOS prompt |
+
+"Unpair and hand device over" writes `OMIUNBND` to `19b10042-…`, which **erases every recording on
+the card** before releasing the bond — the firmware wipes first on purpose, so a new owner cannot
+inherit the previous owner's audio. It is behind two confirmations, and the drop that follows is
+reported as the stale bond it creates rather than as an unexpected disconnect, because the phone
+still holds its half.
 
 ## Two things that cause silent data corruption
 
@@ -84,7 +119,8 @@ Segments run from a few megabytes to hundreds, so a segment is listed as ~60-sec
 app/_layout.tsx, app/index.tsx    expo-router, single screen
 src/ble/constants.ts              UUIDs, opcodes, SD_BLE_SIZE = 440
 src/ble/protocol.ts               pure codec: 21-byte info, 6-byte commands, .idx records
-src/ble/omiDevice.ts              scan, connect, discover, notification stream
+src/ble/pairing.ts                pairing-status codec, and which remedy each failure needs
+src/ble/omiDevice.ts              scan, connect, discover, notification stream, pairing
 src/ble/useOmiConnection.ts       connection state machine (never auto-connects)
 src/sync/plan.ts                  what to fetch, and what is safe to write
 src/sync/syncEngine.ts            per-segment READ loop, stall detection, incremental flush
@@ -102,7 +138,7 @@ scripts/seed-recording.ts         fixture recording, for testing playback withou
 ## Tests
 
 ```bash
-npm test           # 48 tests
+npm test           # 57 tests
 npm run typecheck
 npm run verify:ogg # needs ffmpeg on PATH
 ```
@@ -137,7 +173,8 @@ a real device dump with `--raw dump.bin` — capture one using
 
 ## Verification evidence
 
-Recorded on 21 Aug 2026, macOS 26.6, Xcode 26.0.1, iPhone 17 Pro simulator.
+Recorded on 21 Aug 2026, macOS 26.6, Xcode 26.0.1, iPhone 17 Pro simulator; the pairing evidence
+on 22 Aug against firmware built with `secure-pairing.conf`.
 
 **Frame parser and Ogg muxer — passing.** `npm run verify:ogg`:
 
@@ -230,29 +267,67 @@ Result: 23.7 MB pulled, cancelled=false
   reporting `Synced 23.7 MB` with the audio and the manifest intact — the failure cost only the
   timestamps.
 
-**Not verified: the phone's own BLE stack and the UI.** No iPhone was paired to this machine
+**Pairing against the secure build — passing.** The DevKit was reflashed with `secure-pairing.conf`
+and the Mac holds its single bond, so the app's own `parsePairingStatus` and `diagnosePairing` ran
+against the real 25 bytes through the same bridge:
+
+```
+$ npx tsx scripts/device-sync.ts --dir /tmp/pairing-check
+Connected to 767AD1FF-…, ATT MTU 498
+  pairing: ready (SMP on, 1/1 slots, link encrypted)
+  1 segments on card, sequence 2..2, newest holds 11.8 MB
+
+Result: 13.0 MB pulled, cancelled=false
+  seq 2: 13.0 MB on disk (block-aligned), complete, 210 index records
+```
+
+Cross-checked against the reference client, which reports the same state
+(`python3 pairing.py` → `SMP on, bondable yes, persistent bonds yes / 1 of 1 slots used / security
+level 2`).
+
+A partial pull was interrupted first, so this run also re-exercised resume; it finished
+block-aligned at a steady 15.7 KB/s over 14 minutes, unaffected by the encrypted link. **The `.idx`
+sidecar fetched cleanly for the first time** — 210 records — which is the path that used to reset
+the device. `--decode` then produced 546,100 frames (2.9% resync skips) = 5461.0 s, matching
+`ffprobe`'s `opus / 48000 / 1 / 5461.000000` exactly, mean level −27.4 dB.
+
+**Pairing UI — rendered, not exercised.** The simulator has no BLE, so the three new states were
+forced into the screen with a temporary override, screenshotted, and the override removed: the
+paired row (`Paired · 1 of 1 slot`) with the unpair action, the stale-bond remedy, and the
+"waiting for pairing" spinner.
+
+**Not verified: pairing from iOS itself, the phone's BLE stack, and the UI.** Only the `ready`
+verdict could be produced on real hardware — reaching `needs-pairing`, `stale-bond` or `slot-taken`
+means releasing the bond this Mac holds, which erases the card and leaves the Mac unable to re-pair
+without forgetting the device. Nothing has exercised CoreBluetooth's pairing prompt, which is the
+one step `establishEncryption()` exists for. No iPhone was paired to this machine
 (`xcrun devicectl list devices` → no devices found), so `react-native-ble-plx` itself, scanning,
 the availability timeout, the Connect/Disconnect buttons and the on-device sync UI have still never
 run. The protocol, the resume logic and the audio path above them now have.
 
-**Blocked by a firmware defect: the `.idx` sidecar and any sealed segment.** The DevKit used here
-runs the in-progress ring firmware from this working tree, and it **resets** whenever it is asked
-to read anything other than the newest segment's audio — see "Firmware defect found while testing"
-below. The app handles it the way it handles any drop, but the sealed-segment and timestamp-index
-paths could not be exercised on hardware.
+**Still not exercised on hardware: sealed segments.** The `.idx` sidecar and sealed segments were
+both blocked by the firmware reset described below, which has since been fixed; the sidecar now
+works (above). The card was wiped when the secure image was flashed and holds a single growing
+segment, so there is still no sealed segment to read — that needs a card that has rotated at least
+once (`ring-fast-rotate.conf`).
 
 To finish the job, plug in an iPhone, run `npx expo run:ios --device`, and work through:
 
 1. Power the DevKit on and off, and confirm availability goes stale after ~10 s.
-2. Connect, sync, and confirm the throughput reads around 14–17 KB/s.
-3. Force-quit mid-transfer, reopen, and confirm the resume offset matches the stored byte count.
-4. Disconnect during a sync and confirm the device is not left with an open read handle.
-5. Play a synced chunk and confirm it sounds like the room, not like noise.
+2. Connect and accept the pairing prompt; confirm the Device card then reads `Paired · 1 of 1 slot`.
+3. Connect with the bond held by another device and confirm the app says the slot is taken rather
+   than reporting a generic encryption error.
+4. Unpair from the app, then reconnect without forgetting the device in Settings — the app should
+   report the stale bond, and connecting should work once iOS has forgotten it.
+5. Sync, and confirm the throughput reads around 14–17 KB/s.
+6. Force-quit mid-transfer, reopen, and confirm the resume offset matches the stored byte count.
+7. Disconnect during a sync and confirm the device is not left with an open read handle.
+8. Play a synced chunk and confirm it sounds like the room, not like noise.
 
-## Firmware defect found while testing
+## Firmware defect found while testing — since fixed
 
-The DevKit resets when asked to read **any segment other than the one currently being recorded**,
-and when asked for **any timestamp index**. Reproducible with the reference Python client, so it is
+The DevKit reset when asked to read **any segment other than the one currently being recorded**,
+and when asked for **any timestamp index**. Reproducible with the reference Python client, so it was
 not an app bug:
 
 ```
@@ -266,12 +341,16 @@ The device really is restarting, not just dropping the link: the `sync errors` c
 storage-info characteristic goes 37 → 2 across one failed read, while it climbs monotonically
 (10 → 18 → 27) when the device is left alone.
 
-The likely cause is that `parse_storage_command()` runs in the GATT write callback and, for those
-two cases only, calls `get_file_size()` / `index_get_size_for()` — both of which take `sd_mutex` and
+The cause was that `parse_storage_command()` runs in the GATT write callback and, for those two
+cases only, called `get_file_size()` / `index_get_size_for()` — both of which take `sd_mutex` and
 then `fs_stat()` the card. Reading the newest segment is the one path that answers from the
-in-memory `audio_file_size` counter without touching the filesystem, and it is the one path that
-works. Doing card I/O on the BT RX thread, behind a mutex the audio writer holds across its 8 KB
-flush, is enough to starve the watchdog.
+in-memory `audio_file_size` counter without touching the filesystem, and it was the one path that
+worked. A FatFs directory walk does not fit the BT RX thread's 1 KB stack.
+
+Fixed in the firmware: `parse_storage_command()` now makes no filesystem call at all, and
+`setup_storage_tx()` decides the size on the storage thread, reporting an empty or exhausted target
+from there. The status still arrives as a notification, just a little later than the command ACK,
+which the engine already handled. The app needed no change.
 
 ## Expo SDK version
 

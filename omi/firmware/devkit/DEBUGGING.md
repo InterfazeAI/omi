@@ -529,6 +529,7 @@ parser and decode to WAV. Run them from that directory, since they import `omi_s
 
 ```bash
 python3 info.py                                     # segments, retention, estimated sync time
+python3 pull_all.py ~/Desktop/omi-archive           # the whole card, resumable
 python3 record_and_pull.py 60 ~/Desktop/take1.wav   # record a window, pull it back
 python3 pull_range.py <start> <len> [out.wav] [seg] # re-decode a span already on the card
 python3 throughput.py 25                            # sync speed; ~14-16 KB/s is healthy
@@ -539,6 +540,21 @@ python3 pairing.py --release                        # hand the bond slot to a ne
 
 `pairing.py` reads without needing a bond, so it is the first thing to run when pairing misbehaves;
 `--release` needs the encrypted link, since only the current owner may give the device up.
+
+`pull_all.py` is the whole card, which at ~17 KB/s is hours, so it is built to be interrupted and
+rerun. Two details of the protocol decide how that has to work:
+
+- **Resume only on a 440-byte boundary.** The firmware rounds a read offset down to the block grid,
+  so resuming from an arbitrary file length makes it re-send bytes the file already holds and
+  splice a duplicate into the audio — which decodes without complaint and is silently wrong. The
+  partial block is truncated off before resuming, and re-fetched.
+- **Only the end-of-transfer marker proves a segment is complete.** A read can also end because the
+  requested length arrived or because it stalled, and those look identical from the byte count when
+  the length was not known up front. The transfer reports which of the three happened, and a
+  segment read to end of file is the only one marked done.
+
+Progress lives in the length of each `seg-NNNN.opus`, not in the state file, because bytes hit the
+disk about once a second while the state file is written once per segment.
 
 `record_and_pull.py` handles a rotation landing inside its window by fetching each part and
 joining them, which is the main thing worth exercising with the `ring-fast-rotate.conf` build.
