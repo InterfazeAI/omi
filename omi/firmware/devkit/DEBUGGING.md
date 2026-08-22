@@ -10,7 +10,11 @@ follows cost hours to find and is not obvious from the code.
 - Adafruit MicroSD Card BFF, hand-wired over SPI (not the board the overlay was written for).
   Chip select runs from the BFF's square CS pad to **D0/A0 (P0.02)**, matching the base overlay.
   That wire is the single most failure-prone thing on the board and its failure mode looks exactly
-  like a dying SD card — read Trap 10 before debugging any write failure.
+  like a dying SD card — read Trap 10 before debugging any write failure. A future build can
+  delete the wire entirely: bridging the BFF's **A0** pin-select solder jumper (front of the board,
+  below the card slot, alongside RX and A1) routes chip select to the BFF's A0 edge pad, which
+  already sits on the XIAO's A0/D0 pad in the stack. Same P0.02, so no firmware change — but that
+  stack joint stops being merely structural and must be reflowed as a real electrical joint.
 - No speaker fitted; a latching switch in the battery line instead of the momentary button.
   Build with `sd-on-no-button-speaker.conf` so the firmware does not wait on absent hardware.
 - SPI is pinned to 8 MHz in `overlay/xiao_ble_sense_devkitv2-adafruit.overlay`. Dropping from
