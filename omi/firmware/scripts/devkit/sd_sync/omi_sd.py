@@ -19,6 +19,12 @@ AUDIO_SVC = "19b10000-e8f2-537e-4f6c-d104768a1214"
 CMD_CHAR = "30295781-4301-eabd-2904-2849adfeae43"
 SIZE_CHAR = "30295782-4301-eabd-2904-2849adfeae43"
 
+# Readable without pairing, by design -- it explains why pairing did not work, so requiring
+# pairing to read it would defeat the point. Publishes counters only, never content.
+PAIRING_STATUS_CHAR = "19b10041-e8f2-537e-4f6c-d104768a1214"
+PAIRING_RELEASE_CHAR = "19b10042-e8f2-537e-4f6c-d104768a1214"
+UNBOND_MAGIC = b"OMIUNBND"
+
 READ_COMMAND, DELETE_COMMAND, NUKE_COMMAND, STOP_COMMAND = 0, 1, 2, 3
 END_OF_TRANSFER = 100
 
@@ -190,6 +196,71 @@ class RingInfo:
     def __str__(self):
         return (f"{self.count} segments (seq {self.oldest_seq}..{self.newest_seq}), "
                 f"{self.segment_bytes:,} B each, newest holds {self.newest_bytes:,} B")
+
+
+class PairingStatus:
+    """Why pairing did or did not work, straight from the device.
+
+    Serial logging is not reliable on this board (DEBUGGING.md trap 8) and the SMP debug image
+    does not boot, so this characteristic is the only way to see the reason code the Bluetooth
+    stack produced. It is deliberately readable on an unencrypted link.
+    """
+
+    # bt_security_err, from zephyr/include/zephyr/bluetooth/conn.h
+    SECURITY_ERR = {
+        0: "success",
+        1: "authentication failed",
+        2: "PIN or key missing -- the peer offered a key this device no longer has",
+        3: "OOB data not available",
+        4: "authentication requirements not met",
+        5: "pairing not supported",
+        6: "pairing not allowed -- typically no free bond slot",
+        7: "invalid parameters",
+        8: "key rejected",
+        9: "unspecified",
+    }
+
+    def __init__(self, raw):
+        if len(raw) < 25:
+            raise ValueError(f"pairing status too short: {len(raw)} bytes")
+        self.version = raw[0]
+        flags = raw[1]
+        self.smp_enabled = bool(flags & 0x01)
+        self.bondable = bool(flags & 0x02)
+        self.settings_enabled = bool(flags & 0x04)
+        self.link_encrypted = bool(flags & 0x08)
+        self.bond_count = raw[2]
+        self.max_bonds = raw[3]
+        self.last_pairing_err = raw[4]
+        self.last_security_err = raw[5]
+        self.last_security_level = raw[6]
+        self.current_security_level = raw[7]
+        (self.connections, self.pairing_successes,
+         self.pairing_failures, self.unbond_requests) = struct.unpack("<IIII", raw[8:24])
+        self.last_unbond_result = struct.unpack("<b", raw[24:25])[0]
+
+    @property
+    def slots_full(self):
+        return self.bond_count >= self.max_bonds
+
+    def describe_pairing_err(self):
+        return self.SECURITY_ERR.get(self.last_pairing_err, f"unknown ({self.last_pairing_err})")
+
+    def describe_security_err(self):
+        return self.SECURITY_ERR.get(self.last_security_err, f"unknown ({self.last_security_err})")
+
+
+async def read_pairing_status(client):
+    return PairingStatus(await client.read_gatt_char(PAIRING_STATUS_CHAR))
+
+
+async def release_bond(client):
+    """Hand the device to a new owner. Needs the encrypted link.
+
+    DESTRUCTIVE: the device erases every recording before releasing the bond, so the next device
+    to pair cannot read the previous owner's audio. Pull anything worth keeping first.
+    """
+    await client.write_gatt_char(PAIRING_RELEASE_CHAR, UNBOND_MAGIC, response=True)
 
 
 async def read_info(client):

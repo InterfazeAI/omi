@@ -74,22 +74,25 @@ static void put_le32(uint8_t *p, uint32_t v)
     p[3] = (v >> 24) & 0xFF;
 }
 
+// This service is the one that hands over the recordings, and its command characteristic also
+// accepts DELETE and NUKE. Both halves require an encrypted link: unpaired, a device in radio
+// range could otherwise download every segment on the card or erase all of them.
 static struct bt_gatt_attr storage_service_attr[] = {
     BT_GATT_PRIMARY_SERVICE(&storage_service_uuid),
     BT_GATT_CHARACTERISTIC(&storage_write_uuid.uuid,
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_WRITE,
+                           OMI_PERM_WRITE,
                            NULL,
                            storage_write_handler,
                            NULL),
-    BT_GATT_CCC(storage_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CCC(storage_config_changed_handler, BT_GATT_PERM_READ | OMI_PERM_WRITE),
     BT_GATT_CHARACTERISTIC(&storage_read_uuid.uuid,
                            BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_READ,
+                           OMI_PERM_READ,
                            storage_read_characteristic,
                            NULL,
                            NULL),
-    BT_GATT_CCC(storage_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CCC(storage_config_changed_handler, BT_GATT_PERM_READ | OMI_PERM_WRITE),
 
 };
 
@@ -218,7 +221,13 @@ static int setup_storage_tx()
 }
 uint8_t delete_num = 0;
 uint8_t nuke_started = 0;
+static volatile uint8_t unbond_wipe_started = 0;
 static uint8_t heartbeat_count = 0;
+
+void storage_request_unbond_wipe(void)
+{
+    unbond_wipe_started = 1;
+}
 static uint8_t parse_storage_command(void *buf, uint16_t len)
 {
 
@@ -382,6 +391,15 @@ void storage_write(void)
             clear_audio_directory();
             save_offset(0);
             nuke_started = 0;
+        }
+        if (unbond_wipe_started) {
+            // Wipe before the bond goes, never after: if power is lost here the old bond still
+            // holds, so no new device can pair and read whatever is left on the card.
+            LOG_WRN("erasing all recordings before releasing the bond");
+            clear_audio_directory();
+            save_offset(0);
+            unbond_wipe_started = 0;
+            transport_finish_unbond();
         }
         // Time sync arrives on the BT RX thread, which cannot write the record itself.
         storage_index_service();

@@ -61,7 +61,38 @@ python3 pull_range.py 6164808 142560 ~/Desktop/take1.wav 3
 
 # Check sync speed (healthy is ~14 KB/s)
 python3 throughput.py 25
+
+# Set the device clock, so index marks carry a real date instead of uptime
+python3 set_time.py
 ```
+
+## Pairing
+
+Only relevant to a firmware built with `secure-pairing.conf`; the default image requires no pairing
+and every characteristic is open.
+
+```bash
+python3 pairing.py             # bond slots, pairing errors -- works on an unpaired link
+python3 pairing.py --pair      # trigger the host's pairing prompt
+python3 pairing.py --release   # hand the device to a new owner (ERASES ALL AUDIO)
+```
+
+`pairing.py` reads without a bond on purpose, so it still works when pairing is what is broken. It
+is the first thing to run when a device will not pair.
+
+The board holds **one** bond and never evicts it, so the first device to pair owns it and a second
+is refused. `--release` is how you change owner: it needs the encrypted link, so only the current
+owner can invoke it, and **it erases every recording first** — a new owner must not inherit the
+previous owner's audio. Pull anything worth keeping before running it.
+
+Two things that will look like bugs and are not:
+
+- After a release, the old host still holds its half of the bond and cannot reconnect. macOS
+  reports `Peer removed pairing information` and will not clear it programmatically — forget the
+  device in Bluetooth settings. This does not affect a real handover, where the new owner's phone
+  has no stale bond.
+- If the bonded device is lost or broken it can never ask for the release, so the bond slot stays
+  occupied. That is what `omi_build_unbond.sh` is for, and it clears the bond only, not the card.
 
 ## Reading the output
 

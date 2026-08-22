@@ -10,7 +10,9 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/ring_buffer.h>
 
 #include "config.h"
@@ -37,6 +39,25 @@ uint16_t current_package_index = 0;
 //
 
 struct k_mutex write_sdcard_mutex;
+
+// Only ever referenced from a LOG_DBG, so at the shipped log level the call is compiled out and
+// the missing definition costs nothing -- which is why this went unnoticed. Raise the log level
+// far enough to keep LOG_DBG and the image stops linking, so every debug build was broken.
+static const char *phy2str(uint8_t phy)
+{
+    switch (phy) {
+    case BT_GAP_LE_PHY_NONE:
+        return "none";
+    case BT_GAP_LE_PHY_1M:
+        return "LE 1M";
+    case BT_GAP_LE_PHY_2M:
+        return "LE 2M";
+    case BT_GAP_LE_PHY_CODED:
+        return "LE Coded";
+    default:
+        return "unknown";
+    }
+}
 
 static ssize_t audio_data_write_handler(struct bt_conn *conn,
                                         const struct bt_gatt_attr *attr,
@@ -84,29 +105,33 @@ static struct bt_uuid_128 audio_characteristic_format_uuid =
 static struct bt_uuid_128 audio_characteristic_speaker_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10003, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 
+// Every permission below is the _ENCRYPT variant: live microphone audio and the recording it
+// belongs to must not be readable by an unpaired device. The CCC reads stay unencrypted because
+// the subscription flag itself reveals nothing -- the write that starts the stream is what
+// matters, and that is gated.
 static struct bt_gatt_attr audio_service_attr[] = {
     BT_GATT_PRIMARY_SERVICE(&audio_service_uuid),
     BT_GATT_CHARACTERISTIC(&audio_characteristic_data_uuid.uuid,
                            BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_READ,
+                           OMI_PERM_READ,
                            audio_data_read_characteristic,
                            NULL,
                            NULL),
-    BT_GATT_CCC(audio_ccc_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CCC(audio_ccc_config_changed_handler, BT_GATT_PERM_READ | OMI_PERM_WRITE),
     BT_GATT_CHARACTERISTIC(&audio_characteristic_format_uuid.uuid,
                            BT_GATT_CHRC_READ,
-                           BT_GATT_PERM_READ,
+                           OMI_PERM_READ,
                            audio_codec_read_characteristic,
                            NULL,
                            NULL),
 #ifdef CONFIG_OMI_ENABLE_SPEAKER
     BT_GATT_CHARACTERISTIC(&audio_characteristic_speaker_uuid.uuid,
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_WRITE,
+                           OMI_PERM_WRITE,
                            NULL,
                            audio_data_write_handler,
                            NULL),
-    BT_GATT_CCC(audio_ccc_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), //
+    BT_GATT_CCC(audio_ccc_config_changed_handler, BT_GATT_PERM_READ | OMI_PERM_WRITE), //
 #endif
 
 };
@@ -156,17 +181,19 @@ time_sync_read_handler(struct bt_conn *conn, const struct bt_gatt_attr *attr, vo
     return bt_gatt_attr_read(conn, attr, buf, len, offset, &epoch_s, sizeof(epoch_s));
 }
 
+// The clock is gated too: it stamps the recording index, so an unpaired writer could misdate
+// every future segment and make a recording impossible to place in time.
 static struct bt_gatt_attr time_sync_service_attr[] = {
     BT_GATT_PRIMARY_SERVICE(&time_sync_service_uuid),
     BT_GATT_CHARACTERISTIC(&time_sync_write_uuid.uuid,
                            BT_GATT_CHRC_WRITE,
-                           BT_GATT_PERM_WRITE,
+                           OMI_PERM_WRITE,
                            NULL,
                            time_sync_write_handler,
                            NULL),
     BT_GATT_CHARACTERISTIC(&time_sync_read_uuid.uuid,
                            BT_GATT_CHRC_READ,
-                           BT_GATT_PERM_READ,
+                           OMI_PERM_READ,
                            time_sync_read_handler,
                            NULL,
                            NULL),
@@ -182,18 +209,200 @@ static struct bt_uuid_128 dfu_service_uuid =
 static struct bt_uuid_128 dfu_control_point_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x00001531, 0x1212, 0xEFDE, 0x1523, 0x785FEABCD123));
 
+// One unauthenticated byte here used to reboot the board into the bootloader from anywhere in
+// radio range, which stops recording until someone power-cycles it by hand.
 static struct bt_gatt_attr dfu_service_attr[] = {
     BT_GATT_PRIMARY_SERVICE(&dfu_service_uuid),
     BT_GATT_CHARACTERISTIC(&dfu_control_point_uuid.uuid,
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_WRITE,
+                           OMI_PERM_WRITE,
                            NULL,
                            dfu_control_point_write_handler,
                            NULL),
-    BT_GATT_CCC(dfu_ccc_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CCC(dfu_ccc_config_changed_handler, BT_GATT_PERM_READ | OMI_PERM_WRITE),
 };
 
 static struct bt_gatt_service dfu_service = BT_GATT_SERVICE(dfu_service_attr);
+
+//
+// Pairing service with UUID 19B10040-E8F2-537E-4F6C-D104768A1214
+// - Status  (19B10041-...) read, DELIBERATELY UNENCRYPTED
+// - Release (19B10042-...) write, encrypted, releases the bond slot
+//
+// The status characteristic must stay readable without pairing. It exists to explain why pairing
+// did not work, and a diagnostic that requires the thing it diagnoses is useless. It publishes no
+// secret: counters, a bond count and an error code. Everything that exposes actual content --
+// audio, recordings, the clock, DFU -- stays gated.
+//
+// It is also the only usable channel. Serial logging on this board is not reliable (see
+// DEBUGGING.md trap 8) and the SMP debug image does not boot, so without this the failure reason
+// the stack already knows is simply thrown away.
+static struct bt_uuid_128 pairing_service_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10040, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 pairing_status_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10041, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 pairing_release_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10042, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+
+#define PAIRING_STATUS_BYTES 25
+
+// Any write to the release characteristic must carry exactly this. The encrypted link already
+// proves the writer is the owner; the magic guards against a buggy or truncated write silently
+// throwing away the bond and locking the owner out of their own device.
+static const uint8_t unbond_magic[8] = {'O', 'M', 'I', 'U', 'N', 'B', 'N', 'D'};
+
+static uint32_t connection_count = 0;
+static uint32_t pairing_successes = 0;
+static uint32_t pairing_failures = 0;
+static uint32_t unbond_requests = 0;
+static uint8_t last_pairing_err = 0;
+static uint8_t last_security_err = 0;
+static uint8_t last_security_level = 0;
+static int8_t last_unbond_result = 0;
+
+static void bond_count_cb(const struct bt_bond_info *info, void *user_data)
+{
+    (*(uint8_t *) user_data)++;
+}
+
+static uint8_t count_bonds(void)
+{
+    uint8_t n = 0;
+#if defined(CONFIG_BT_SMP)
+    // Walks the in-RAM key table, not flash, so this is safe from a GATT handler. Anything that
+    // reached storage would violate DEBUGGING.md trap 7.
+    bt_foreach_bond(BT_ID_DEFAULT, bond_count_cb, &n);
+#endif
+    return n;
+}
+
+static ssize_t pairing_status_read_handler(struct bt_conn *conn,
+                                           const struct bt_gatt_attr *attr,
+                                           void *buf,
+                                           uint16_t len,
+                                           uint16_t offset)
+{
+    uint8_t status[PAIRING_STATUS_BYTES] = {0};
+
+    uint8_t flags = 0;
+    if (IS_ENABLED(CONFIG_BT_SMP)) {
+        flags |= 0x01;
+    }
+    if (IS_ENABLED(CONFIG_BT_BONDABLE)) {
+        flags |= 0x02;
+    }
+    if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+        flags |= 0x04;
+    }
+    if (conn && bt_conn_get_security(conn) >= BT_SECURITY_L2) {
+        flags |= 0x08;
+    }
+
+    status[0] = 1; // layout version, so a host tool can refuse a payload it cannot read
+    status[1] = flags;
+    status[2] = count_bonds();
+    status[3] = CONFIG_BT_MAX_PAIRED;
+    status[4] = last_pairing_err;
+    status[5] = last_security_err;
+    status[6] = last_security_level;
+    status[7] = conn ? (uint8_t) bt_conn_get_security(conn) : 0;
+    sys_put_le32(connection_count, status + 8);
+    sys_put_le32(pairing_successes, status + 12);
+    sys_put_le32(pairing_failures, status + 16);
+    sys_put_le32(unbond_requests, status + 20);
+    status[24] = (uint8_t) last_unbond_result;
+
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, status, sizeof(status));
+}
+
+// bt_unpair() writes the bond out of NVS. That is flash work, and a GATT handler runs on the
+// Bluetooth RX thread with a 1 KB stack -- the exact shape that crashed this firmware twice before
+// (DEBUGGING.md trap 7). The handler only latches; the system work queue does the erase.
+static void unbond_work_handler(struct k_work *work)
+{
+    int err = bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+    last_unbond_result = (int8_t) err;
+    LOG_WRN("bond slot released by owner request (err %d)", err);
+
+    // The peer keeps its half of a bond that no longer exists here, so leaving it connected means
+    // an encrypted link backed by a key the device has forgotten. Drop it and let it reconnect.
+    if (current_connection) {
+        bt_conn_disconnect(current_connection, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    }
+}
+
+static K_WORK_DEFINE(unbond_work, unbond_work_handler);
+
+// Called by the storage thread once the card has been erased. Kept as a separate step so the
+// bond outlives the wipe: an interrupted release leaves the device still bonded rather than
+// leaving an unwiped card open to whoever pairs next.
+void transport_finish_unbond(void)
+{
+    k_work_submit(&unbond_work);
+}
+
+static ssize_t pairing_release_write_handler(struct bt_conn *conn,
+                                             const struct bt_gatt_attr *attr,
+                                             const void *buf,
+                                             uint16_t len,
+                                             uint16_t offset,
+                                             uint8_t flags)
+{
+    if (len != sizeof(unbond_magic) || memcmp(buf, unbond_magic, sizeof(unbond_magic)) != 0) {
+        LOG_WRN("rejected bond release: bad magic (len %u)", len);
+        return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+    }
+
+    unbond_requests++;
+
+    // Does not unpair here. Releasing the bond must destroy the recordings first, or the next
+    // device to pair inherits the previous owner's audio. The storage thread erases the card and
+    // then calls transport_finish_unbond(); this handler only asks.
+    storage_request_unbond_wipe();
+    return len;
+}
+
+static struct bt_gatt_attr pairing_service_attr[] = {
+    BT_GATT_PRIMARY_SERVICE(&pairing_service_uuid),
+    BT_GATT_CHARACTERISTIC(&pairing_status_uuid.uuid,
+                           BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ,
+                           pairing_status_read_handler,
+                           NULL,
+                           NULL),
+    // Encrypted on purpose: only the device that currently holds the bond may give it up. An
+    // unpaired attacker cannot reach this for the same reason it cannot read the recordings.
+    BT_GATT_CHARACTERISTIC(&pairing_release_uuid.uuid,
+                           BT_GATT_CHRC_WRITE,
+                           OMI_PERM_WRITE,
+                           NULL,
+                           pairing_release_write_handler,
+                           NULL),
+};
+
+static struct bt_gatt_service pairing_service = BT_GATT_SERVICE(pairing_service_attr);
+
+#if defined(CONFIG_BT_SMP)
+static void pairing_complete_cb(struct bt_conn *conn, bool bonded)
+{
+    pairing_successes++;
+    last_pairing_err = 0;
+    LOG_INF("pairing complete (bonded %d), bonds now %u", bonded, count_bonds());
+}
+
+static void pairing_failed_cb(struct bt_conn *conn, enum bt_security_err reason)
+{
+    pairing_failures++;
+    last_pairing_err = (uint8_t) reason;
+    LOG_ERR("pairing failed, reason %u", reason);
+}
+
+static struct bt_conn_auth_info_cb auth_info_callbacks = {
+    .pairing_complete = pairing_complete_cb,
+    .pairing_failed = pairing_failed_cb,
+};
+#endif
+
 // Acceleration data
 // this code activates the onboard accelerometer. some cute ideas may include shaking the necklace to color strobe
 //
@@ -469,6 +678,8 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
 
     LOG_INF("bluetooth activated");
 
+    connection_count++;
+
     if (current_connection != NULL) {
         bt_conn_unref(current_connection);
     }
@@ -533,9 +744,31 @@ static void _le_data_length_updated(struct bt_conn *conn, struct bt_conn_le_data
     current_mtu = info->tx_max_len;
 }
 
+// The single most useful signal when pairing misbehaves: it fires whether the procedure succeeded
+// or failed, and carries the reason code the stack would otherwise keep to itself. Recorded into
+// the pairing-status characteristic because serial is not readable on this board.
+//
+// The callback only exists in `struct bt_conn_cb` when SMP is compiled in, so both the function and
+// the assignment below must be guarded or the default non-secure image stops compiling.
+#if defined(CONFIG_BT_SMP)
+static void _security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
+{
+    last_security_err = (uint8_t) err;
+    last_security_level = (uint8_t) level;
+    if (err) {
+        LOG_ERR("security change failed: level %u, err %u", level, err);
+    } else {
+        LOG_INF("security changed: level %u", level);
+    }
+}
+#endif
+
 static struct bt_conn_cb _callback_references = {
     .connected = _transport_connected,
     .disconnected = _transport_disconnected,
+#if defined(CONFIG_BT_SMP)
+    .security_changed = _security_changed,
+#endif
     .le_param_req = _le_param_req,
     .le_param_updated = _le_param_updated,
     .le_phy_updated = _le_phy_updated,
@@ -826,6 +1059,12 @@ int transport_start()
     // Configure callbacks
     bt_conn_cb_register(&_callback_references);
 
+#if defined(CONFIG_BT_SMP)
+    // Without this the stack knows exactly why a pairing attempt failed and discards it, which is
+    // what made the first attempt at this feature pure guesswork.
+    bt_conn_auth_info_cb_register(&auth_info_callbacks);
+#endif
+
     // Enable Bluetooth
     int err = bt_enable(NULL);
     if (err) {
@@ -833,6 +1072,28 @@ int transport_start()
         return err;
     }
     LOG_INF("Transport bluetooth initialized");
+
+    // Bonds are useless unless they are reloaded here: without this the single bond slot looks
+    // empty on every boot, the paired phone is asked to pair again, and the first stranger to
+    // connect can claim the slot instead.
+    //
+    // Never fatal. Returning an error here would abort transport_start(), and main() treats that
+    // as "stop", so the device would never advertise -- a corrupted bond area would turn into a
+    // permanently silent board with no way in over the air to fix it. Losing the bonds and asking
+    // the owner to pair again is always the better failure.
+    if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+        int serr = settings_load();
+        if (serr) {
+            LOG_ERR("Failed to load bonds (err %d); continuing unpaired", serr);
+        }
+    }
+
+#ifdef CONFIG_OMI_ERASE_BONDS_ON_BOOT
+    // Recovery image only; see the Kconfig help. Reflashing does not clear the bond partition and
+    // there is no button, so this is the only way back from a bond you no longer control.
+    err = bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+    LOG_WRN("erased all Bluetooth bonds (err %d) -- flash the normal image back now", err);
+#endif
 
     //  Enable button
 #ifdef CONFIG_OMI_ENABLE_BUTTON
@@ -849,6 +1110,7 @@ int transport_start()
     bt_gatt_service_register(&audio_service);
     bt_gatt_service_register(&time_sync_service);
     bt_gatt_service_register(&dfu_service);
+    bt_gatt_service_register(&pairing_service);
     err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
     if (err) {
         LOG_ERR("Transport advertising failed to start (err %d)", err);

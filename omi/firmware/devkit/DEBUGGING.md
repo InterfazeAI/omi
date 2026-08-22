@@ -30,6 +30,12 @@ docker run --rm -v "$(pwd)/omi:/omi" -e CMAKE_PREFIX_PATH=/opt/toolchains \
 ```
 
 `omi_build_diag.sh` is the same image plus `diag-threads.conf` (per-thread CPU accounting).
+`omi_build_secure.sh` is the same image plus `secure-pairing.conf`, which requires a paired,
+encrypted link for audio, recordings, the clock and DFU. `omi_build_unbond.sh` erases every bond at
+boot; it is the recovery path when the bonded device is gone and cannot release the slot itself.
+
+Use the image tag above verbatim. `zephyr-build:v0.26.13` is **not** on this machine and asking for
+it silently starts a multi-gigabyte pull that looks like an extremely slow build.
 
 Flashing is UF2: double-tap RST, wait for `/Volumes/XIAO-SENSE`, then copy the image. Two
 macOS quirks waste time here:
@@ -267,6 +273,78 @@ Healthy baseline after the joint was repaired, for comparison: six minutes of re
 2.77 KB/s with zero I/O failures, then a 366 KB pull at 13.7 KB/s producing 13,191 frames with no
 decode errors, with the counters still at zero afterwards and recording uninterrupted throughout.
 
+### 11. `BT_GATT_PERM_*_ENCRYPT` without `CONFIG_BT_SMP` bricks the device silently
+
+The board advertises, connects, and answers the unencrypted battery characteristic, but every
+useful characteristic returns ATT error 15, `Insufficient Encryption`. Reflashing does not fix it.
+Rebooting does not fix it. Toggling the host's Bluetooth does not fix it.
+
+The cause is a build where the GATT attributes carry the `_ENCRYPT` permission variants while SMP
+is compiled out. Zephyr honours the permission regardless; with no Security Manager there is no way
+to ever establish encryption, so the attribute is unreachable for the life of the image. The device
+is behaving exactly as told.
+
+It is a nasty one because the symptom impersonates a host problem. `Insufficient Encryption`
+arriving from a device that cannot do encryption reads as a stale GATT cache on the central, and
+macOS genuinely does cache service databases, so the false explanation is plausible enough to
+survive a Bluetooth restart and a reflash before anyone doubts it. Two things break the illusion:
+the error persists after flashing an image built with SMP off, and it appears on the very first
+connection from a central that has never seen the device.
+
+The fix is that permissions must track the Kconfig, never be hardcoded. `transport.h` defines
+`OMI_PERM_READ` / `OMI_PERM_WRITE`, which expand to the `_ENCRYPT` variants only under
+`CONFIG_BT_SMP`. Use those in every `BT_GATT_CHARACTERISTIC` and `BT_GATT_CCC`; a literal
+`BT_GATT_PERM_READ_ENCRYPT` in `storage.c` or `transport.c` is a bug. This matters specifically
+because pairing lives in an optional fragment (`secure-pairing.conf`), so the SMP-off build is a
+configuration that ships, not a hypothetical.
+
+### 12. Pairing does not fail, it starves — the codec outranks the ECDH thread
+
+Pairing from a host produces a prompt, the prompt is accepted, and then nothing happens. The
+encrypted read eventually times out on the host and the device reports `BT_SECURITY_ERR_UNSPECIFIED`
+(reason 9) with the link still at security level 1 and the bond slot still empty.
+
+"Unspecified" is a red herring. `smp.c` has roughly forty sites that return it, but only one is
+reachable here: `smp_timeout()` calls `smp_pairing_complete(smp, BT_SMP_ERR_UNSPECIFIED)`. The
+pairing was never refused — it stalled and hit the 30 s SMP limit. Time the failed attempt: about
+thirty seconds of dead wait is the confirmation, and it distinguishes this from a real rejection,
+which returns immediately.
+
+The stall is a priority inversion between the application and the Bluetooth controller:
+
+| Thread | Priority |
+|---|---|
+| codec (`codec.c`) | `K_PRIO_PREEMPT(4)` |
+| BT CTLR ECDH (`nrf/subsys/bluetooth/controller/ecdh.c`) | `K_PRIO_PREEMPT(10)` |
+
+LE Secure Connections needs a P-256 ECDH computation before pairing can complete, and nrfxlib runs
+it on that dedicated low-priority thread. This device records continuously from the moment it powers
+on, so the codec is always runnable and always wins. Trap 5 measured multi-second scheduling gaps at
+priority 7; priority 10 does worse, and the computation never finishes inside the pairing window.
+Because recording never stops, pairing fails **every** time rather than intermittently, which makes
+it look like a protocol or host bug instead of a scheduling one.
+
+Fix: `CONFIG_BT_CTLR_ECDH_IN_MPSL_WORK=y` in `secure-pairing.conf`, which runs the computation in
+the MPSL workqueue — above the codec instead of below it. The documented cost is delaying MPSL work,
+which is acceptable for a one-off computation that only happens at pairing time.
+
+Four plausible causes were wrong, and each cost a cycle. Do not re-litigate them:
+
+- **The host.** macOS was blamed twice. It was never involved.
+- **The bond slot.** `BT_MAX_PAIRED=1` with no eviction genuinely does refuse new pairings when
+  full, so "a stale bond from an earlier attempt" is a compelling story. The diagnostics said 0 of 1
+  slots used, killing it in one read.
+- **`CONFIG_BT_SMP_ENFORCE_MITM`.** It looks fatal for a device with no display or keypad. It is
+  not: `smp.c` explicitly clears the MITM bit when IO capability is `NoInputNoOutput`, so the
+  setting is a no-op on this board.
+- **A missing crypto backend.** `CONFIG_BT_ECC` and `CONFIG_BT_CTLR_ECDH` (Oberon) are both present.
+
+The reason this was findable at all is the pairing-status characteristic, which is deliberately
+readable on an **unencrypted** link. A diagnostic that requires the thing it diagnoses is useless,
+and serial was mute throughout — the SMP debug image does not even boot (it hangs after the reset
+reason, before `watchdog_init()`, so no watchdog reset ever fires to reveal it). Trap 8 again: on
+this board, BLE is the only observation channel that works.
+
 ## Measured Baselines
 
 Use these to tell "slow" from "broken" without re-deriving them.
@@ -396,6 +474,54 @@ Downloads should start on a 440-byte boundary. `DELETE` used to break recording 
 deleting the segment being recorded now opens a fresh one immediately, but prefer reading from an
 offset over deleting during testing.
 
+### Pairing service `19b10040-e8f2-537e-4f6c-d104768a1214`
+
+Only present in a `secure-pairing.conf` build. Two characteristics with deliberately opposite
+permissions.
+
+`19b10041` — status, 25 bytes, **read without encryption on purpose**. This is the channel that
+made Trap 12 diagnosable; gating it behind pairing would make it useless exactly when it is needed.
+It exposes counters and error codes only, never content.
+
+| Offset | Type | Meaning |
+|---|---|---|
+| 0 | `u8` | layout version, currently 1 |
+| 1 | `u8` | flags: `0x01` SMP built in, `0x02` bondable, `0x04` bonds persist, `0x08` this link encrypted |
+| 2 | `u8` | bond slots used |
+| 3 | `u8` | bond slots total (`CONFIG_BT_MAX_PAIRED`) |
+| 4 | `u8` | `bt_security_err` of the last pairing attempt |
+| 5 | `u8` | `bt_security_err` of the last security change |
+| 6 | `u8` | security level reached by that change |
+| 7 | `u8` | security level of the current link |
+| 8 | `u32` | connections since boot |
+| 12 | `u32` | pairings that succeeded |
+| 16 | `u32` | pairings that failed |
+| 20 | `u32` | bond releases requested |
+| 24 | `i8` | result of the last release |
+
+Reason 9 (`unspecified`) with the level stuck at 1 and an empty bond slot is the Trap 12 signature.
+
+`19b10042` — release, write, **encrypted**. Write exactly the eight bytes `OMIUNBND` to give up the
+bond slot so another device can pair. Encrypted because only the current owner may hand the device
+over; the magic exists so a truncated or stray write cannot orphan the board.
+
+**This erases every recording.** Releasing the bond hands the device to someone else, and they must
+not inherit the previous owner's audio, so the card is wiped as part of the release. The sequence is
+three threads on purpose:
+
+1. GATT handler (Bluetooth RX thread) validates the magic and calls `storage_request_unbond_wipe()`.
+   It touches nothing else — filesystem or NVS work on this stack is Trap 7.
+2. Storage thread runs `clear_audio_directory()`, resets the saved offset, then calls
+   `transport_finish_unbond()`.
+3. System work queue runs `bt_unpair()` and drops the connection.
+
+The wipe must complete **before** the bond is released. Losing power midway then leaves the old bond
+intact, so no new device can pair and read what survived; releasing first would open exactly that
+window.
+
+This is the normal way to change owner. `omi_build_unbond.sh` remains the recovery path for when
+the bonded device is lost or broken and can no longer ask.
+
 ## Host Tools
 
 `../scripts/devkit/sd_sync/` implements all of the above — discovery, download, the resyncing
@@ -406,7 +532,13 @@ python3 info.py                                     # segments, retention, estim
 python3 record_and_pull.py 60 ~/Desktop/take1.wav   # record a window, pull it back
 python3 pull_range.py <start> <len> [out.wav] [seg] # re-decode a span already on the card
 python3 throughput.py 25                            # sync speed; ~14-16 KB/s is healthy
+python3 pairing.py                                  # bond slots, pairing errors (works unpaired)
+python3 pairing.py --pair                           # trigger the host's pairing prompt
+python3 pairing.py --release                        # hand the bond slot to a new device
 ```
+
+`pairing.py` reads without needing a bond, so it is the first thing to run when pairing misbehaves;
+`--release` needs the encrypted link, since only the current owner may give the device up.
 
 `record_and_pull.py` handles a rotation landing inside its window by fetching each part and
 joining them, which is the main thing worth exercising with the `ring-fast-rotate.conf` build.
@@ -453,3 +585,21 @@ them.
   affect file size — a 14 dB louder take changed the data rate by 0.6% — so lowering it to ~52
   (+6 dB) would cost no capacity. Kept at 64 by choice.
 - 32 kbps was judged clearly better on soft sounds than the 20 kbps currently configured.
+- There is no serial-log image for Security Manager debugging. One was written and deleted: it hung
+  after printing the banner and the reset reason, before `watchdog_init()`, so the board sat there
+  advertising nothing and not even resetting. It was never needed — Trap 12 was diagnosed entirely
+  through the unencrypted pairing-status characteristic, which works on a board you cannot pair
+  with and cannot read serial from. Extend that characteristic before reaching for a serial console.
+- Link security is opt-in via `secure-pairing.conf` and is not in the default image. Turning it on
+  makes every client re-pair, so it should land together with the app-side change. The app has no
+  pairing awareness at all yet, including the stale-bond case after a release.
+- Kconfig fragments fail silently when their dependencies are missing, and nothing warns. This has
+  already shipped a broken image once: `erase-bonds.conf` on its own cannot select
+  `CONFIG_OMI_ERASE_BONDS_ON_BOOT`, which depends on `BT_SETTINGS` from `secure-pairing.conf`, so
+  the recovery image built cleanly, booted, and erased nothing — a recovery path that quietly does
+  not recover. **After changing any build script, grep the generated `.config` for the symbol you
+  expected rather than trusting that the build succeeded.**
+- Code guarded by `CONFIG_BT_SMP` must be guarded in both directions. `struct bt_conn_cb` has no
+  `security_changed` member without SMP, so an unguarded assignment breaks the default image while
+  the secure one still builds — build all three images (`omi_build.sh`, `omi_build_secure.sh`,
+  `omi_build_unbond.sh`) before believing a Bluetooth change compiles.

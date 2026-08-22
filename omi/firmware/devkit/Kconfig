@@ -73,4 +73,15 @@ config OMI_ENABLE_HAPTIC
         "Enable the haptic support."
     default n
 
+config OMI_ERASE_BONDS_ON_BOOT
+    bool "Erase all Bluetooth bonds at startup"
+    depends on BT_SETTINGS
+    help
+        "Recovery build, never production. There is one bond slot and no eviction, so the first
+        device to pair owns the board and no other can. Bonds live in the `storage` flash
+        partition, outside the app region, so a normal reflash does not clear them and there is
+        no button to hold. Flash this image once, let it boot, then flash the normal image back
+        and pair the device you actually want."
+    default n
+
 endmenu
