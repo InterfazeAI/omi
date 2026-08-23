@@ -69,6 +69,37 @@ python3 throughput.py 25
 python3 set_time.py
 ```
 
+## When a tool sits at "...rescanning"
+
+The board is probably connected, not missing. A BLE peripheral stops advertising while a link is
+up, and because the board is bonded, macOS re-establishes that link on its own after a tool exits
+uncleanly — so it stays connected to the system with no client using it, and no scan will ever see
+it. Check with `blueutil --connected`.
+
+The tools try the last known address before scanning, which attaches to the existing link and
+usually makes this invisible. If you do get stuck, disconnecting the board in Bluetooth settings
+makes it advertise again. See DEBUGGING.md trap 16.
+
+## Battery
+
+```bash
+python3 battery.py             # level, plus the measurement behind it
+python3 battery.py --watch 10  # sample for 10 min: a charging cell must move
+```
+
+It also reports whether the charger is running, read from the BQ25100's `~CHG` pin. Note that
+"not charging" covers fully charged, no USB, and no cell — the chip reports all three the same way.
+
+The standard battery percentage cannot tell a flat cell from a disconnected sense line, so
+`battery.py` reports the measurement behind it: raw ADC counts, the enable pin read back from the
+hardware, the driver's error codes, and two controls. It samples with the divider switched off as
+well as on, which separates an open resistor from a switch that is not switching, and it reads the
+3.3 V rail through the same ADC, which proves the converter works before any zero is blamed on the
+wiring. A zero reading means nothing without that last one.
+
+Before concluding anything from 0%, make sure the battery is actually switched into circuit: with
+the cell cut off and the board on USB, the reading is legitimately zero.
+
 ## Pairing
 
 Only relevant to a firmware built with `secure-pairing.conf`; the default image requires no pairing
@@ -94,8 +125,16 @@ Two things that will look like bugs and are not:
   reports `Peer removed pairing information` and will not clear it programmatically — forget the
   device in Bluetooth settings. This does not affect a real handover, where the new owner's phone
   has no stale bond.
-- If the bonded device is lost or broken it can never ask for the release, so the bond slot stays
-  occupied. That is what `omi_build_unbond.sh` is for, and it clears the bond only, not the card.
+- If the bonded device is lost or broken it can never ask for the release over BLE. On a board with
+  the button fitted, **hold it for 5 seconds** — same wipe-then-release, reached physically instead
+  of over an encrypted link that a departed owner is no longer there to open. The LED turns yellow
+  at 2 seconds and letting go before 5 cancels it; that warning is the only confirmation, and the
+  erase is irreversible. `omi_build_unbond.sh` remains the recovery path for a board with no button,
+  and it clears the bond only, not the card.
+
+After any release, the board advertises normally but every connection attempt disconnects at once,
+because the host is still offering a key the board has discarded. It looks like a dead board. Run
+`pairing.py --pair` to bond again and it comes straight back.
 
 ## Pulling the whole card
 
@@ -110,6 +149,10 @@ python3 pull_all.py ~/Desktop/omi-archive --decode-only    # re-decode, no devic
 Interrupt it however you like — Ctrl-C, a dropped link, `kill -9` — and run the same command
 again. It reconnects by itself while running, and on a fresh start it continues from the last
 440-byte block it wrote.
+
+If the output file stops growing for 90 seconds the link is abandoned and rebuilt. That guard is
+not paranoia: a dead BLE link does not raise, it blocks, and an earlier version of this tool sat
+wedged for over two hours inside the call that tells the device to stop (DEBUGGING.md trap 13).
 
 **The part files are the progress record, not `pull-state.json`.** Bytes reach the disk about once
 a second; the state file is rewritten once per segment. So the resume point is the length of

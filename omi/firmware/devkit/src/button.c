@@ -14,6 +14,7 @@
 #include "mic.h"
 #include "sdcard.h"
 #include "speaker.h"
+#include "storage.h"
 #include "transport.h"
 #include "wdog_facade.h"
 LOG_MODULE_REGISTER(button, CONFIG_LOG_DEFAULT_LEVEL);
@@ -55,12 +56,18 @@ static void button_ccc_config_changed_handler(const struct bt_gatt_attr *attr, u
         LOG_ERR("Invalid CCC value: %u", value);
     }
 }
-struct gpio_dt_spec d4_pin = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
-                              .pin = 4,
-                              .dt_flags = GPIO_OUTPUT_ACTIVE}; // 3.3
-struct gpio_dt_spec d5_pin_input = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
-                                    .pin = 5,
-                                    .dt_flags = GPIO_INT_EDGE_RISING};
+/*
+ * Both pins are active high, which is what dt_flags = 0 means.
+ *
+ * These previously held GPIO_OUTPUT_ACTIVE and GPIO_INT_EDGE_RISING. Neither belongs in dt_flags,
+ * which carries only the devicetree-level flags (active level, drive strength) and is 16 bits
+ * wide -- both constants live above bit 16, so both truncated to 0 and the compiler said so with
+ * -Woverflow. Active high is what the rest of this file assumes, so the behaviour was right by
+ * accident. Saying 0 outright keeps that behaviour and drops the warnings. The configuration and
+ * interrupt flags that were meant here are passed explicitly to the calls in button_init().
+ */
+struct gpio_dt_spec d4_pin = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)), .pin = 4, .dt_flags = 0};
+struct gpio_dt_spec d5_pin_input = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)), .pin = 5, .dt_flags = 0};
 
 static bool was_pressed = false;
 
@@ -92,17 +99,9 @@ K_WORK_DELAYABLE_DEFINE(button_work, check_button_level);
 
 // 4 is button down, 5 is button up
 static FSM_STATE_T current_button_state = IDLE;
-static uint32_t inc_count_1 = 0;
-static uint32_t inc_count_0 = 0;
 
 static int final_button_state[2] = {0, 0};
-const static int threshold = 10;
 
-static void reset_count()
-{
-    inc_count_0 = 0;
-    inc_count_1 = 0;
-}
 static inline void notify_press()
 {
     final_button_state[0] = BUTTON_PRESS;
@@ -156,288 +155,126 @@ static inline void notify_long_tap()
 #define BUTTON_PRESSED 1
 #define BUTTON_RELEASED 0
 
-#define TAP_THRESHOLD 300     // 300 ms for single tap
-#define DOUBLE_TAP_WINDOW 600 // 600 ms maximum for double-tap
-#define LONG_PRESS_TIME 3000  // 3000 ms for long press (power off)
+#define TAP_THRESHOLD 300    // a press shorter than this counts as a tap
+#define MULTI_TAP_WINDOW 600 // longest gap between taps belonging to one gesture
+#define RESET_WARN_TIME 2000 // yellow LED: keep holding and the recordings go
+#define RESET_HOLD_TIME 5000 // erase the card and release the bond
 
 typedef enum {
     BUTTON_EVENT_NONE,
     BUTTON_EVENT_SINGLE_TAP,
     BUTTON_EVENT_DOUBLE_TAP,
-    BUTTON_EVENT_LONG_PRESS,
-    BUTTON_EVENT_RELEASE
+    BUTTON_EVENT_TRIPLE_TAP,
 } ButtonEvent;
 
+// Ticks of BUTTON_CHECK_INTERVAL. Free-running: every comparison is a subtraction, which stays
+// correct across the u32 wrap. The old code zeroed this on release and compared absolute values,
+// so a press that straddled the reset measured its duration from the wrong origin.
 static uint32_t current_time = 0;
 static uint32_t btn_press_start_time;
-static uint32_t btn_release_time;
-static uint32_t btn_last_tap_time;
+static uint32_t btn_last_release_time;
 static bool btn_is_pressed;
+static uint8_t tap_count;
+static bool reset_fired;
 
-static u_int8_t btn_last_event = BUTTON_EVENT_NONE;
+bool button_reset_warning = false;
+
+static uint32_t elapsed_ms(uint32_t since)
+{
+    return (current_time - since) * BUTTON_CHECK_INTERVAL;
+}
+
+static void show_reset_warning(bool on)
+{
+    if (button_reset_warning == on) {
+        return;
+    }
+    button_reset_warning = on;
+
+    // Yellow is red and green together. set_led_state() in main.c leaves the LEDs alone while the
+    // flag is set, otherwise its 500 ms refresh would blink the warning away as fast as it appears.
+    set_led_red(on);
+    set_led_green(on);
+}
 
 void check_button_level(struct k_work *work_item)
 {
-    current_time = current_time + 1;
+    current_time++;
 
-    u_int8_t btn_state = was_pressed ? BUTTON_PRESSED : BUTTON_RELEASED;
-
+    uint8_t btn_state = was_pressed ? BUTTON_PRESSED : BUTTON_RELEASED;
     ButtonEvent event = BUTTON_EVENT_NONE;
 
-    // Debouncing pressed state
     if (btn_state == BUTTON_PRESSED && !btn_is_pressed) {
         btn_is_pressed = true;
         btn_press_start_time = current_time;
+        reset_fired = false;
     } else if (btn_state == BUTTON_RELEASED && btn_is_pressed) {
         btn_is_pressed = false;
-        btn_release_time = current_time;
+        btn_last_release_time = current_time;
+        show_reset_warning(false);
 
-        // Check for double tap
-        uint32_t press_duration = (btn_release_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL;
-        if (press_duration < TAP_THRESHOLD) {
-            if (btn_last_tap_time > 0 &&
-                (current_time - btn_last_tap_time) * BUTTON_CHECK_INTERVAL < DOUBLE_TAP_WINDOW) {
-                event = BUTTON_EVENT_DOUBLE_TAP;
-                btn_last_tap_time = 0; // Reset double-tap / single-tap detection
-            } else {
-                btn_last_tap_time = current_time;
-            }
+        if (elapsed_ms(btn_press_start_time) < TAP_THRESHOLD) {
+            tap_count++;
+        } else {
+            // A hold that was let go before RESET_HOLD_TIME. It is not a tap, and it must not
+            // combine with the next one into a two-tap gesture.
+            tap_count = 0;
         }
-    }
-
-    // Check for single tap
-    if (btn_state == BUTTON_RELEASED && !btn_is_pressed) {
-        uint32_t press_duration = (btn_release_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL;
-        if (press_duration < TAP_THRESHOLD && btn_last_tap_time > 0 &&
-            (current_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL > TAP_THRESHOLD) {
-            event = BUTTON_EVENT_SINGLE_TAP;
-            btn_last_tap_time = 0;
-        } else if ((current_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL > TAP_THRESHOLD) {
-            event = BUTTON_EVENT_RELEASE;
-        }
-    }
-
-    // Check for long press
-    if (btn_is_pressed && (current_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL >= LONG_PRESS_TIME) {
-        event = BUTTON_EVENT_LONG_PRESS;
-    }
-
-    // Single tap
-    if (event == BUTTON_EVENT_SINGLE_TAP) {
-        LOG_PRINTK("single tap detected\n");
-        btn_last_event = event;
-        notify_tap();
-    }
-
-    // Double tap
-    if (event == BUTTON_EVENT_DOUBLE_TAP) {
-        LOG_PRINTK("double tap detected\n");
-        btn_last_event = event;
-        notify_double_tap();
-    }
-
-    // Long press, one time event
-    if (event == BUTTON_EVENT_LONG_PRESS && btn_last_event != BUTTON_EVENT_LONG_PRESS) {
-        LOG_PRINTK("long press detected\n");
-        btn_last_event = event;
-
-        // Enter the low power mode
-        is_off = true;
-        bt_off();
-        turnoff_all();
-    }
-
-    // Releases, one time event
-    if (event == BUTTON_EVENT_RELEASE && btn_last_event != BUTTON_EVENT_RELEASE) {
-        LOG_PRINTK("release detected\n");
-        btn_last_event = event;
         notify_unpress();
-
-        // Reset
-        current_time = 0;
-        btn_press_start_time = 0;
-        btn_release_time = 0;
-        btn_last_tap_time = 0;
-    }
-    if (event == BUTTON_EVENT_RELEASE) {
         current_button_state = GRACE;
     }
 
-    k_work_reschedule(&button_work, K_MSEC(BUTTON_CHECK_INTERVAL));
-    return 0;
-}
+    // Held down: warn first, then fire once. reset_fired keeps a continued hold from re-arming it.
+    if (btn_is_pressed) {
+        uint32_t held = elapsed_ms(btn_press_start_time);
+        if (held >= RESET_HOLD_TIME) {
+            if (!reset_fired) {
+                reset_fired = true;
+                tap_count = 0;
+                LOG_PRINTK("reset hold: erasing the card, then releasing the bond\n");
+#if defined(CONFIG_BT_SMP)
+                // Only asks. The storage thread erases the card and calls transport_finish_unbond()
+                // afterwards, so an interruption leaves the bond intact rather than leaving an
+                // unwiped card open to whoever pairs next. Same path as the BLE release command.
+                storage_request_unbond_wipe();
+#endif
+            }
+        } else if (held >= RESET_WARN_TIME) {
+            show_reset_warning(true);
+        }
+    }
 
-// @deprecated
-// #define LONG_PRESS_INTERVAL 25
-// #define SINGLE_PRESS_INTERVAL 2
-// void check_button_level_2(struct k_work *work_item)
-//{
-//     //insert the current button state here
-//    int state_ = was_pressed ? 1 : 0;
-//    if (current_button_state == IDLE)
-//    {
-//        if (state_ == 0)
-//        {
-//            //Do nothing!
-//        }
-//        else if (state_ == 1)
-//        {
-//            //Also do nothing, but transition to the next state
-//            notify_press();
-//            current_button_state = ONE_PRESS;
-//            if (is_off)
-//           {
-//             is_off = false;
-//             bt_on();
-//             play_haptic_milli(50);
-//           }
-//        }
-//    }
-//
-//    else if (current_button_state == ONE_PRESS)
-//    {
-//        if (state_ == 0)
-//        {
-//
-//            if(inc_count_0 == 0)
-//            {
-//                notify_unpress();
-//            }
-//            inc_count_0++; //button is unpressed
-//            if (inc_count_0 > SINGLE_PRESS_INTERVAL)
-//            {
-//                //If button is not pressed for a little while.......
-//                //transition to Two_press. button could be a single or double tap
-//                current_button_state = TWO_PRESS;
-//                reset_count();
-//            }
-//        }
-//        if (state_ == 1)
-//        {
-//            inc_count_1++; //button is pressed
-//
-//            if (inc_count_1 > LONG_PRESS_INTERVAL)
-//            {
-//                //If button is pressed for a long time.......
-//                notify_long_tap();
-//                //play_haptic_milli(10);
-//                //Fire the long mode notify and enter a grace period
-//                //turn off herre
-//                // TODO: FIXME
-//                //if(!from_wakeup)
-//                //{
-//                //    is_off = !is_off;
-//                //}
-//                //else
-//                //{
-//                //    from_wakeup = false;
-//                //}
-//                //if (is_off)
-//                //{
-//                //    bt_off();
-//                //    turnoff_all();
-//                //}
-//                current_button_state = GRACE;
-//                reset_count();
-//            }
-//
-//        }
-//
-//    }
-//
-//    else if (current_button_state == TWO_PRESS)
-//    {
-//        if (state_ == 0)
-//        {
-//            if (inc_count_1 > 0)
-//            { // if button has been pressed......
-//                notify_unpress();
-//                notify_double_tap();
-//
-//                //Fire the notify and enter a grace period
-//                current_button_state = GRACE;
-//                reset_count();
-//            }
-//             //single button press
-//            else if (inc_count_0 > 10)
-//            {
-//                notify_tap(); //Fire the notify and enter a grace period
-//                if(!from_wakeup)
-//                {
-//                    is_off = !is_off;
-//                }
-//                else
-//                {
-//                    from_wakeup = false;
-//                }
-//                //Fire the notify and enter a grace period
-//                if (is_off)
-//                {
-//                    bt_off();
-//                    turnoff_all();
-//                }
-//                current_button_state = GRACE;
-//                reset_count();
-//            }
-//            else
-//            {
-//                inc_count_0++; //not pressed
-//            }
-//        }
-//        else if (state_ == 1 )
-//        {
-//            if (inc_count_1 == 0)
-//            {
-//                notify_press();
-//                inc_count_1++;
-//            }
-//            if (inc_count_1 > threshold)
-//            {
-//                notify_long_tap();
-//                //play_haptic_milli(10);
-//                // TODO: FIXME
-//                //if(!from_wakeup)
-//                //{
-//                //    is_off = !is_off;
-//                //}
-//                //else
-//                //{
-//                //    from_wakeup = false;
-//                //}
-//                ////Fire the notify and enter a grace period
-//                //if (is_off)
-//                //{
-//                //    bt_off();
-//                //    turnoff_all();
-//                //}
-//                current_button_state = GRACE;
-//                reset_count();
-//            }
-//        }
-//    }
-//
-//    else if (current_button_state == GRACE)
-//    {
-//        if (state_ == 0)
-//        {
-//            if (inc_count_0 == 0 && (inc_count_1 > 0))
-//            {
-//                notify_unpress();
-//            }
-//            inc_count_0++;
-//            if (inc_count_0 > 1)
-//            {
-//                current_button_state = IDLE;
-//                reset_count();
-//            }
-//        }
-//        else if (state_ == 1)
-//        {
-//            inc_count_1++;
-//        }
-//    }
-//    k_work_reschedule(&button_work, K_MSEC(BUTTON_CHECK_INTERVAL));
-//}
+    // Taps resolve only once the window for another one has closed. Reporting each tap as it
+    // happens would make a triple arrive as a single and then a double, and the double is a
+    // gesture of its own -- the count has to be settled before anything is emitted.
+    if (!btn_is_pressed && tap_count > 0 && elapsed_ms(btn_last_release_time) > MULTI_TAP_WINDOW) {
+        event = (tap_count == 1)   ? BUTTON_EVENT_SINGLE_TAP
+                : (tap_count == 2) ? BUTTON_EVENT_DOUBLE_TAP
+                                   : BUTTON_EVENT_TRIPLE_TAP;
+        tap_count = 0;
+    }
+
+    switch (event) {
+    case BUTTON_EVENT_SINGLE_TAP:
+        LOG_PRINTK("single tap detected\n");
+        notify_tap();
+        break;
+    case BUTTON_EVENT_DOUBLE_TAP:
+        LOG_PRINTK("double tap detected\n");
+        notify_double_tap();
+        break;
+    case BUTTON_EVENT_TRIPLE_TAP:
+        LOG_PRINTK("triple tap detected -- powering down\n");
+        is_off = true;
+        bt_off();
+        turnoff_all(); // does not return: ends in SYSTEMOFF
+        break;
+    default:
+        break;
+    }
+
+    k_work_reschedule(&button_work, K_MSEC(BUTTON_CHECK_INTERVAL));
+}
 
 static ssize_t button_data_read_characteristic(struct bt_conn *conn,
                                                const struct bt_gatt_attr *attr,
@@ -458,11 +295,23 @@ int button_init()
         LOG_ERR("Error setting up D4 Pin");
         return -1;
     }
-    if (gpio_pin_configure_dt(&d4_pin, GPIO_OUTPUT_ACTIVE) < 0) {
+    /*
+     * Driven low, so D4 is a ground for a button wired between D4 and D5.
+     *
+     * It used to be driven high, which cannot work: D5 idles high on its own pull-up, so a button
+     * bridging D4 and D5 shorts high to high. The pin never moves, the edge interrupt never fires,
+     * and every gesture is silently lost -- the board looks like it has no button at all rather
+     * than a broken one.
+     *
+     * Low also leaves a button wired between D5 and GND working, since D4 is then unconnected.
+     * One firmware, both wirings. The press current is the pull-up across ~13k, a couple hundred
+     * microamps, which this pin sinks comfortably.
+     */
+    if (gpio_pin_configure_dt(&d4_pin, GPIO_OUTPUT_INACTIVE) < 0) {
         LOG_ERR("Error setting up D4 Pin Voltage");
         return -1;
     } else {
-        LOG_INF("D4 ready to transmit voltage");
+        LOG_INF("D4 held low as the button return path");
     }
     if (gpio_is_ready_dt(&d5_pin_input)) {
         LOG_INF("D5 Pin ready");
@@ -471,7 +320,19 @@ int button_init()
         return -1;
     }
 
-    int err2 = gpio_pin_configure_dt(&d5_pin_input, GPIO_INPUT);
+    /*
+     * Pulled up, not bare. The button shorts D5 to ground, so "not pressed" has to be held high
+     * by something; with nothing holding it the pin floats, drifts low on its own, and the state
+     * machine below reads three seconds of that as a long press -- which is the gesture that
+     * calls turnoff_all() and SYSTEMOFF. A board that switches itself off at random looks like a
+     * power fault rather than a GPIO configuration bug, and it is why CONFIG_OMI_ENABLE_BUTTON
+     * had to be turned off on the devkit build.
+     *
+     * The pull-up also makes the wake work. turnoff_all() arms GPIO_INT_LEVEL_INACTIVE as the
+     * System OFF wake source, which fires when D5 goes low; a floating pin would trip that
+     * immediately and the board would wake straight back up.
+     */
+    int err2 = gpio_pin_configure_dt(&d5_pin_input, GPIO_INPUT | GPIO_PULL_UP);
 
     if (err2 != 0) {
         LOG_ERR("Error setting up D5 Pin");

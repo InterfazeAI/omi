@@ -8,6 +8,7 @@ import asyncio
 import ctypes
 import ctypes.util
 import math
+import os
 import struct
 import sys
 import time
@@ -26,6 +27,11 @@ PAIRING_STATUS_CHAR = "19b10041-e8f2-537e-4f6c-d104768a1214"
 PAIRING_RELEASE_CHAR = "19b10042-e8f2-537e-4f6c-d104768a1214"
 UNBOND_MAGIC = b"OMIUNBND"
 
+# Why the battery percentage is what it is. Unencrypted for the same reason as pairing status: a
+# diagnostic that needs a working device is useless when the device is not working.
+BATTERY_DIAG_CHAR = "19b10051-e8f2-537e-4f6c-d104768a1214"
+BATTERY_LEVEL_CHAR = "00002a19-0000-1000-8000-00805f9b34fb"
+
 READ_COMMAND, DELETE_COMMAND, NUKE_COMMAND, STOP_COMMAND = 0, 1, 2, 3
 END_OF_TRANSFER = 100
 
@@ -35,6 +41,10 @@ SEGMENT_INDEX_FLAG = 0x80
 SD_BLE_SIZE = 440
 RATE = 16000
 FRAME_SAMPLES = 160
+
+# Tearing down a transfer talks to the device, which is unreliable precisely when a transfer has
+# just failed. Never wait on it for long.
+CLEANUP_TIMEOUT_S = 5
 
 # Ask for more than any file holds to mean "read to the end"; the firmware ends the transfer
 # itself. download() recognises it and reports progress without a percentage, since the total
@@ -159,15 +169,68 @@ class Progress:
             print(line, flush=True)
 
 
+_LAST_DEVICE = os.path.expanduser("~/.cache/omi_sd/last-device")
+
+
+def _remember(address):
+    """Keep the address so the next run can reach a board that has stopped advertising."""
+    try:
+        os.makedirs(os.path.dirname(_LAST_DEVICE), exist_ok=True)
+        with open(_LAST_DEVICE, "w") as f:
+            f.write(str(address))
+    except OSError:
+        pass  # a cache that cannot be written just means the next run scans, which still works
+
+
+def _remembered():
+    try:
+        with open(_LAST_DEVICE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+async def _reachable(address, timeout=10):
+    """Whether we can open a link to this address right now."""
+    try:
+        async with BleakClient(address, timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 async def find_device(timeout=120):
-    """Scan until the recorder shows up. It only advertises once the SD card has mounted."""
+    """Locate the recorder and return its address, or None. It only advertises once the SD card
+    has mounted.
+
+    Tries the last known address before scanning, because scanning alone cannot find a board that
+    is already connected. A peripheral stops advertising the moment it accepts a link, and since
+    the board is bonded, macOS silently re-establishes that link after any unclean exit -- so the
+    common case after a crashed tool is a board that is perfectly healthy, perfectly reachable,
+    and completely invisible to a scan. Addressing it directly attaches to the existing link.
+
+    Always an address string, never a BleakScanner device. The two paths below used to return
+    different types, so every tool worked while scanning and broke the moment the cached address
+    was used -- and the cache is hit exactly when the board is connected, which is the situation
+    the cache exists to rescue. BleakClient accepts an address, so callers are unaffected.
+    """
+    known = _remembered()
+    if known and await _reachable(known):
+        return known
+
     deadline = time.time() + timeout
+    hinted = False
     while time.time() < deadline:
         found = await BleakScanner.discover(timeout=6.0, return_adv=True)
         for _, (dev, adv) in found.items():
             if AUDIO_SVC in [u.lower() for u in (adv.service_uuids or [])]:
-                return dev
+                _remember(dev.address)
+                return dev.address
         print("  ...rescanning", flush=True)
+        if not hinted:
+            hinted = True
+            print("  (a board that is already connected does not advertise -- check with\n"
+                  "   `blueutil --connected`, and disconnect it if it is listed)", flush=True)
     return None
 
 
@@ -272,6 +335,82 @@ class PairingStatus:
         return self.SECURITY_ERR.get(self.last_security_err, f"unknown ({self.last_security_err})")
 
 
+class BatteryDiag:
+    """The inputs behind the battery percentage.
+
+    The percentage alone cannot distinguish a flat cell from a disconnected sense line: a floating
+    ADC input reads noise around zero, which clamps to 0% or 100% depending only on its sign.
+    """
+
+    MIN_BYTES = 26
+
+    def __init__(self, raw):
+        if len(raw) < self.MIN_BYTES:
+            raise ValueError(f"battery diagnostic is {len(raw)} bytes, expected "
+                             f"{self.MIN_BYTES}; reflash, the firmware is older than this tool")
+        self.version = raw[0]
+        # P0.14 switches the divider in, so 0 means enabled. Read back from the pin register, not
+        # from what the firmware believes it wrote.
+        self.read_enable_level = raw[1]
+        self.raw_counts = struct.unpack("<h", raw[2:4])[0]
+        self.adc_mv, self.battery_mv = struct.unpack("<ii", raw[4:12])
+        self.percentage = raw[12]
+        (self.init_err, self.setup_err, self.gpio_err,
+         self.read_err, self.call_err) = struct.unpack("<bbbbb", raw[13:18])
+        # Counts with the divider deliberately switched off. This is what separates an open
+        # resistor from a switch that is not switching.
+        self.off_counts = struct.unpack("<h", raw[18:20])[0]
+        self.enable_is_output = raw[20]
+        self.charging = bool(raw[21])
+        # The same ADC pointed at the 3.3V rail. Without this every zero below is ambiguous
+        # between a dead pin and a dead converter.
+        self.vdd_mv = struct.unpack("<i", raw[22:26])[0]
+
+    @property
+    def adc_trustworthy(self):
+        """The control reads a real 3.3V rail, so the converter and the maths are sound."""
+        return 2800 < self.vdd_mv < 3800
+
+    @property
+    def divider_enabled(self):
+        return self.read_enable_level == 0
+
+    @property
+    def dead_on(self):
+        """Nothing at the pin with the divider switched in."""
+        return abs(self.adc_mv) < 100
+
+    @property
+    def dead_off(self):
+        """Nothing at the pin with the divider switched out."""
+        return abs(self.off_counts) < 100
+
+    def verdict(self):
+        if self.init_err or self.setup_err or self.gpio_err or self.read_err or self.call_err:
+            return ("the driver is reporting an error; the gauge never had a chance "
+                    "(see the error codes above)")
+        if not self.enable_is_output:
+            return ("P0.14 is not configured as an output, so nothing is switching the divider. "
+                    "Firmware fault, and fixable.")
+        if not self.divider_enabled:
+            return ("P0.14 is HIGH, so the divider is switched out. Firmware fault, and fixable.")
+        if not self.adc_trustworthy:
+            return (f"the control reads {self.vdd_mv} mV for a 3.3V rail, so the ADC itself is "
+                    "misconfigured. Nothing else here means anything until that is fixed -- and "
+                    "it is a firmware fault, not a hardware one.")
+        if self.dead_on and not self.dead_off:
+            return ("the pin carries voltage with the divider switched out but not switched in, "
+                    "so BAT+ and the resistors are fine and the divider's switch is the fault.")
+        if self.dead_on and self.dead_off:
+            return ("nothing reaches P0.31 in either switch position, so no current is arriving "
+                    "from BAT+ at all. That is the module's internal divider, under the shield.")
+        return "the gauge is reading the cell"
+
+
+async def read_battery_diag(client):
+    return BatteryDiag(await client.read_gatt_char(BATTERY_DIAG_CHAR))
+
+
 async def read_pairing_status(client):
     return PairingStatus(await client.read_gatt_char(PAIRING_STATUS_CHAR))
 
@@ -358,9 +497,16 @@ async def _transfer(client, start, length, file_no, stall_limit, on_drain, on_pr
                 reason = "stall"
                 break
     finally:
+        # Bounded, because this is exactly where an unattended pull dies. A write-with-response
+        # to a peer that has silently gone away never completes -- CoreBluetooth waits for an
+        # acknowledgement that is not coming -- so the stall the loop just detected turns into a
+        # process sitting there for hours having printed nothing. Observed once: 2h16m hung here,
+        # after a clean 10 s stall detection, with the link dead and nothing to say so.
         try:
-            await client.write_gatt_char(CMD_CHAR, _command(STOP_COMMAND), response=True)
-            await client.stop_notify(CMD_CHAR)
+            await asyncio.wait_for(
+                client.write_gatt_char(CMD_CHAR, _command(STOP_COMMAND), response=True),
+                timeout=CLEANUP_TIMEOUT_S)
+            await asyncio.wait_for(client.stop_notify(CMD_CHAR), timeout=CLEANUP_TIMEOUT_S)
         except Exception:
             pass
 

@@ -34,20 +34,15 @@ int battery_set_fast_charge(void);
 int battery_set_slow_charge(void);
 
 /**
- * @brief Start battery charging.
+ * @brief Whether the charger is currently charging the cell.
  *
- * @retval 0 if successful. Negative errno number on error.
+ * @retval 1 charging, 0 not charging, negative errno on error.
+ *
+ * @note Not charging covers three different situations -- fully charged, no USB, and no cell --
+ * because the BQ25100 reports them all the same way on one pin. Charging starting and then
+ * stopping after a minute is how a *fully charged* cell looks, and also how a *missing* one does.
  */
-int battery_charge_start(void);
-
-/**
- * @brief Stop battery charging.
- *
- * @retval 0 if successful. Negative errno number on error.
- *
- * @note: want to stop charging to save power during runtime (Disables LED).
- */
-int battery_charge_stop(void);
+int battery_is_charging(void);
 
 /**
  * @brief Calculates the battery voltage using the ADC.
@@ -76,5 +71,50 @@ int battery_get_percentage(uint8_t *battery_percentage, uint16_t battery_millivo
  * @retval 0 if successful. Negative errno number on error.
  */
 int battery_init(void);
+
+/**
+ * @brief Everything behind the battery percentage, for working out why it is wrong.
+ *
+ * The gauge has exactly one output and three ways to be wrong -- a disabled divider, a failed
+ * init, or bad arithmetic -- and they are indistinguishable from the percentage alone. A floating
+ * ADC input in particular reports 0% or 100% depending only on the sign of the noise, which reads
+ * as a flat or a full battery rather than as no measurement at all.
+ *
+ * Serial is not usable on this board (DEBUGGING.md trap 8), so these go out over BLE.
+ *
+ * `off_counts` is the reading with the divider switched off, and it is the field that identifies
+ * *which* part is broken. A reading of zero while switched on is ambiguous on its own -- it fits
+ * both an open high side and a switch stuck off -- so the complementary state has to be sampled
+ * to tell them apart:
+ *
+ *   off high, on low     both resistors fine, the switch is not switching
+ *   off low,  on low     nothing is arriving from BAT+; the high side is open
+ *   off high, on scaled  working normally
+ *
+ * `vdd_mv` reads the chip's own 3.3 V supply through the same ADC, reference and gain, and is
+ * what makes any of the above admissible. A broken converter returns zero exactly like a dead
+ * pin does, so without a known-good input on the same hardware every conclusion drawn from a
+ * zero is really a guess about which of the two failed.
+ */
+struct battery_diag {
+    int16_t raw_counts;       /**< averaged raw ADC counts, signed: near zero means nothing is connected */
+    int32_t adc_mv;           /**< raw_counts converted to millivolts at the ADC pin */
+    int32_t battery_mv;       /**< adc_mv scaled by the divider, before any clamping */
+    uint8_t percentage;       /**< what the gauge would report */
+    uint8_t read_enable;      /**< OUT register for P0.14: 0 = we are driving the divider on */
+    uint8_t enable_is_output; /**< DIR register for P0.14: 0 means the drive above never happened */
+    int16_t off_counts;       /**< counts with the divider switched off -- see below */
+    int32_t vdd_mv;           /**< same ADC pointed at the 3.3V supply: the control, see below */
+    uint8_t charging;         /**< P0.17 (~CHG) from the BQ25100: 1 = charging */
+    int8_t init_err;          /**< result of the last battery_init() */
+    int8_t setup_err;         /**< result of adc_channel_setup() during init */
+    int8_t gpio_err;          /**< result of configuring the three control pins */
+    int8_t read_err;          /**< result of the last adc_read() */
+};
+
+/**
+ * @brief Fill in a snapshot of the gauge's inputs. Performs a fresh ADC read.
+ */
+int battery_get_diagnostics(struct battery_diag *diag);
 
 #endif

@@ -382,6 +382,62 @@ static struct bt_gatt_attr pairing_service_attr[] = {
 
 static struct bt_gatt_service pairing_service = BT_GATT_SERVICE(pairing_service_attr);
 
+// Diagnostics service with UUID 19B10050-E8F2-537E-4F6C-D104768A1214
+// - Battery (19B10051-...) read, unencrypted
+//
+// The standard Battery Service reports one number, and when that number is wrong it cannot say
+// why. A floating sense input reports 0% or 100% purely according to the sign of the noise, which
+// looks like a flat or a full battery rather than like no measurement at all. This exposes the
+// inputs behind the number so the difference is visible from the host.
+static struct bt_uuid_128 diagnostics_service_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10050, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 battery_diag_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10051, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+
+#define BATTERY_DIAG_BYTES 26
+
+static ssize_t battery_diag_read_handler(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         void *buf,
+                                         uint16_t len,
+                                         uint16_t offset)
+{
+    struct battery_diag diag = {0};
+    uint8_t out[BATTERY_DIAG_BYTES] = {0};
+
+    int err = battery_get_diagnostics(&diag);
+
+    out[0] = 5; // layout version
+    out[1] = diag.read_enable;
+    sys_put_le16((uint16_t) diag.raw_counts, &out[2]);
+    sys_put_le32((uint32_t) diag.adc_mv, &out[4]);
+    sys_put_le32((uint32_t) diag.battery_mv, &out[8]);
+    out[12] = diag.percentage;
+    out[13] = (uint8_t) diag.init_err;
+    out[14] = (uint8_t) diag.setup_err;
+    out[15] = (uint8_t) diag.gpio_err;
+    out[16] = (uint8_t) diag.read_err;
+    out[17] = (uint8_t) err;
+    sys_put_le16((uint16_t) diag.off_counts, &out[18]);
+    out[20] = diag.enable_is_output;
+    out[21] = diag.charging;
+    sys_put_le32((uint32_t) diag.vdd_mv, &out[22]);
+
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, out, sizeof(out));
+}
+
+static struct bt_gatt_attr diagnostics_service_attr[] = {
+    BT_GATT_PRIMARY_SERVICE(&diagnostics_service_uuid),
+    BT_GATT_CHARACTERISTIC(&battery_diag_uuid.uuid,
+                           BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ,
+                           battery_diag_read_handler,
+                           NULL,
+                           NULL),
+};
+
+static struct bt_gatt_service diagnostics_service = BT_GATT_SERVICE(diagnostics_service_attr);
+
 #if defined(CONFIG_BT_SMP)
 static void pairing_complete_cb(struct bt_conn *conn, bool bonded)
 {
@@ -1111,6 +1167,7 @@ int transport_start()
     bt_gatt_service_register(&time_sync_service);
     bt_gatt_service_register(&dfu_service);
     bt_gatt_service_register(&pairing_service);
+    bt_gatt_service_register(&diagnostics_service);
     err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
     if (err) {
         LOG_ERR("Transport advertising failed to start (err %d)", err);
@@ -1119,9 +1176,7 @@ int transport_start()
         LOG_INF("Advertising successfully started");
     }
 
-    int battErr = 0;
-    battErr |= battery_init();
-    battErr |= battery_charge_start();
+    int battErr = battery_init();
     if (battErr) {
         LOG_ERR("Battery init failed (err %d)", battErr);
     } else {

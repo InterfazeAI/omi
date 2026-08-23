@@ -6,6 +6,7 @@
 #include "codec.h"
 #include "config.h"
 #include "led.h"
+#include "lib/battery/battery.h"
 #include "mic.h"
 #include "rtc.h"
 #include "sdcard.h"
@@ -100,6 +101,13 @@ static void boot_led_sequence(void)
 
 void set_led_state()
 {
+    // Yellow while the button is warning about a reset. Checked before anything else because this
+    // refresh runs every 500 ms: without the early return it would clear the warning colour almost
+    // as soon as button.c set it, leaving no signal at all before the card is erased.
+    if (button_reset_warning) {
+        return;
+    }
+
     // Recording and connected state - BLUE
 
     if (usb_charge) {
@@ -182,11 +190,6 @@ int main(void)
         return err;
     }
 
-    err = battery_charge_start();
-    if (err) {
-        LOG_ERR("Battery failed to start (err %d)", err);
-        return err;
-    }
     LOG_INF("Battery initialized");
 #endif
 

@@ -29,7 +29,7 @@ async def main():
         print("device not found - is it advertising? a failed SD mount stops BLE entirely")
         return
 
-    print(f"\n  {device.name or 'unnamed'}  [{device.address}]")
+    print(f"\n  Omi DevKit 2  [{device}]")
     async with BleakClient(device, timeout=25.0) as client:
         await asyncio.sleep(2.0)
         info = await omi_sd.read_info(client)

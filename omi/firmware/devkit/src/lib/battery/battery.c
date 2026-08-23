@@ -16,6 +16,8 @@
 
 #include "battery.h"
 
+#include <hal/nrf_gpio.h>
+#include <string.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/adc.h>
@@ -24,13 +26,33 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(battery, LOG_LEVEL_INF);
 
+// Kept from the last battery_init()/adc_read() so the BLE diagnostic can report why the gauge is
+// not working. Serial is not readable on this board, so an error that is only logged is lost.
+static int8_t init_err;
+static int8_t setup_err;
+static int8_t gpio_err;
+static int8_t last_read_err;
+
 static const struct device *gpio_battery_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 static const struct device *adc_battery_dev = DEVICE_DT_GET(DT_NODELABEL(adc));
 
 static K_MUTEX_DEFINE(battery_mut);
 
+/*
+ * Pin roles, from Seeed's own board definition for this module (variant.cpp, g_ADigitalPinMap):
+ *
+ *   13, // D22 is P0.13 (HICHG)     charge current select, output: low = 100 mA, high-Z = 50 mA
+ *   17, // D23 is P0.17 (~CHG)      charge status, INPUT from the BQ25100, low while charging
+ *   14, // D14 is P0.14 (READ_BAT)  divider enable, output: low = divider switched in
+ *   31, // D32 is P0.31 (VBAT)      divider tap, AIN7
+ *
+ * P0.17 was previously named CHARGING_ENABLE here and driven as a push-pull output. There is no
+ * such control: the BQ25100 decides when to charge, and that pin is how it reports what it chose.
+ * Driving it fought the charger's open-drain output every time it pulled low, and threw away the
+ * one signal that distinguishes "on USB and charging" from "running the cell down".
+ */
 #define GPIO_BATTERY_CHARGE_SPEED 13
-#define GPIO_BATTERY_CHARGING_ENABLE 17
+#define GPIO_BATTERY_CHARGE_STATUS 17
 #define GPIO_BATTERY_READ_ENABLE 14
 
 // Change this to a higher number for better averages
@@ -44,14 +66,66 @@ int16_t sample_buffer[ADC_TOTAL_SAMPLES];
 #define ADC_REFERENCE ADC_REF_INTERNAL             // 0.6V
 #define ADC_GAIN ADC_GAIN_1_6                      // ADC REFERENCE * 6 = 3.6V
 
+// The divider presents 1M||510k = 338k to the SAADC, and Nordic's acquisition-time table wants
+// 40us for anything up to 800k. At the 10us default the sampling capacitor never finishes
+// charging, so every reading comes in low -- a quiet few percent of error, not a failure, which
+// is the kind that survives for years.
+#define ADC_ACQUISITION ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)
+
 struct adc_channel_cfg channel_7_cfg = {.gain = ADC_GAIN,
                                         .reference = ADC_REFERENCE,
-                                        .acquisition_time = ADC_ACQ_TIME_DEFAULT,
+                                        .acquisition_time = ADC_ACQUISITION,
                                         .channel_id = ADC_CHANNEL,
 #ifdef CONFIG_ADC_NRFX_SAADC
                                         .input_positive = ADC_PORT
 #endif
 };
+
+/*
+ * The SAADC can sample the chip's own 3.3 V supply with no external wiring, which makes it the
+ * control for every other reading. A reading from AIN7 is evidence about the divider only if the
+ * ADC is known to work, and a misconfigured ADC returns zero exactly like a dead pin does. VDD is
+ * a known 3.3 V, so if it reads correctly then the converter, reference, gain and conversion are
+ * all sound and a zero from AIN7 can only be the pin.
+ *
+ * VDDHDIV5 was tried here too, in the hope that this module runs in high-voltage mode and feeds
+ * VDDH from the cell -- that would be a battery gauge with no divider and no wiring. It does not:
+ * the reading moved by 3 mV across a full USB removal. See DEBUGGING.md trap 14.
+ */
+#define ADC_VDD_CHANNEL 0
+
+static int16_t reference_buffer;
+
+static int read_reference(uint8_t channel_id, uint8_t input, int32_t *out_mv)
+{
+    struct adc_channel_cfg cfg = {.gain = ADC_GAIN,
+                                  .reference = ADC_REFERENCE,
+                                  .acquisition_time = ADC_ACQUISITION,
+                                  .channel_id = channel_id,
+#ifdef CONFIG_ADC_NRFX_SAADC
+                                  .input_positive = input
+#endif
+    };
+    struct adc_sequence seq = {
+        .channels = BIT(channel_id),
+        .buffer = &reference_buffer,
+        .buffer_size = sizeof(reference_buffer),
+        .resolution = ADC_RESOLUTION,
+    };
+    int mv;
+
+    if (adc_channel_setup(adc_battery_dev, &cfg) != 0 || adc_read(adc_battery_dev, &seq) != 0) {
+        return -EIO;
+    }
+
+    mv = reference_buffer;
+    if (adc_raw_to_millivolts(adc_ref_internal(adc_battery_dev), ADC_GAIN, ADC_RESOLUTION, &mv) != 0) {
+        return -EIO;
+    }
+
+    *out_mv = mv;
+    return 0;
+}
 
 static struct adc_sequence_options options = {
     .extra_samplings = ADC_TOTAL_SAMPLES - 1,
@@ -117,63 +191,128 @@ int battery_set_slow_charge()
     return gpio_pin_set(gpio_battery_dev, GPIO_BATTERY_CHARGE_SPEED, 0); // SLOW charge 50mA
 }
 
-int battery_charge_start()
+int battery_is_charging()
 {
-    int ret = 0;
-
     if (!is_initialized) {
         return -ECANCELED;
     }
-    ret |= battery_enable_read();
-    ret |= gpio_pin_set(gpio_battery_dev, GPIO_BATTERY_CHARGING_ENABLE, 1);
-    return ret;
+
+    // Configured GPIO_ACTIVE_LOW, so the logical value already reads the way the pin is named:
+    // the BQ25100 pulls ~CHG low while it is charging, which arrives here as 1.
+    return gpio_pin_get(gpio_battery_dev, GPIO_BATTERY_CHARGE_STATUS);
 }
 
-int battery_charge_stop()
+// Divider fitted on the XIAO between BAT+ and P0.31, switched to ground by P0.14.
+#define BATTERY_R1 1000 // 1M ohm, high side
+#define BATTERY_R2 510  // 510K ohm, low side
+
+static int battery_measure(struct battery_diag *diag)
 {
-    if (!is_initialized) {
-        return -ECANCELED;
+    int ret = 0;
+    uint16_t adc_vref = adc_ref_internal(adc_battery_dev);
+    int32_t counts = 0;
+    int adc_mv;
+
+    k_mutex_lock(&battery_mut, K_FOREVER);
+    ret = adc_read(adc_battery_dev, &sequence);
+    if (ret) {
+        LOG_WRN("ADC read failed (error %d)", ret);
+        k_mutex_unlock(&battery_mut);
+        last_read_err = (int8_t) ret;
+        return ret;
+    }
+    last_read_err = 0;
+
+    for (uint8_t sample = 0; sample < ADC_TOTAL_SAMPLES; sample++) {
+        counts += sample_buffer[sample];
+    }
+    counts /= ADC_TOTAL_SAMPLES;
+
+    adc_mv = (int) counts;
+    ret = adc_raw_to_millivolts(adc_vref, ADC_GAIN, ADC_RESOLUTION, &adc_mv);
+    k_mutex_unlock(&battery_mut);
+    if (ret) {
+        return ret;
     }
 
-    return gpio_pin_set(gpio_battery_dev, GPIO_BATTERY_CHARGING_ENABLE, 0);
+    diag->raw_counts = (int16_t) counts;
+    diag->adc_mv = adc_mv;
+    // Scale in one expression rather than computing the ratio first. As two integers,
+    // (R1 + R2) / R2 truncates 2.96 to 2, which someone previously compensated for by inflating
+    // R1 until it truncated to 3 instead -- leaving a "calibration" that was really a rounding
+    // artefact, and a reading 1.3% high.
+    diag->battery_mv = ((int32_t) adc_mv * (BATTERY_R1 + BATTERY_R2)) / BATTERY_R2;
+    return 0;
 }
 
 int battery_get_millivolt(uint16_t *battery_millivolt)
 {
-
-    int ret = 0;
-
-    // Voltage divider circuit (Should tune R1 in software if possible)
-    const uint16_t R1 = 1037; // Originally 1M ohm, calibrated after measuring actual voltage values. Can happen due to
-                              // resistor tolerances, temperature ect..
-    const uint16_t R2 = 510;  // 510K ohm
-
-    // ADC measure
-    uint16_t adc_vref = adc_ref_internal(adc_battery_dev);
-    int adc_mv = 0;
-
-    k_mutex_lock(&battery_mut, K_FOREVER);
-    ret |= adc_read(adc_battery_dev, &sequence);
+    struct battery_diag diag = {0};
+    int ret = battery_measure(&diag);
 
     if (ret) {
-        LOG_WRN("ADC read failed (error %d)", ret);
+        return ret;
     }
 
-    // Get average sample value.
-    for (uint8_t sample = 0; sample < ADC_TOTAL_SAMPLES; sample++) {
-        adc_mv += sample_buffer[sample]; // ADC value, not millivolt yet.
+    // Clamp rather than cast. The SAADC returns small negative values when its input is floating,
+    // and a negative millivolt count assigned straight to a uint16_t wraps to about 65000 -- sails
+    // past the 4074 mV top of the discharge curve and reports a *full* battery. A device that
+    // cannot measure its cell must never claim it is full; reporting empty at least fails loudly.
+    if (diag.battery_mv < 0) {
+        LOG_WRN("negative battery reading (%d mV) - sense input is probably floating", diag.battery_mv);
+        *battery_millivolt = 0;
+    } else if (diag.battery_mv > UINT16_MAX) {
+        *battery_millivolt = UINT16_MAX;
+    } else {
+        *battery_millivolt = (uint16_t) diag.battery_mv;
     }
-    adc_mv /= ADC_TOTAL_SAMPLES;
-
-    // Convert ADC value to millivolts
-    ret |= adc_raw_to_millivolts(adc_vref, ADC_GAIN, ADC_RESOLUTION, &adc_mv);
-
-    // Calculate battery voltage.
-    *battery_millivolt = adc_mv * ((R1 + R2) / R2);
-    k_mutex_unlock(&battery_mut);
 
     LOG_DBG("%d mV", *battery_millivolt);
-    return ret;
+    return 0;
+}
+
+int battery_get_diagnostics(struct battery_diag *diag)
+{
+    struct battery_diag off = {0};
+    int ret;
+
+    memset(diag, 0, sizeof(*diag));
+    diag->init_err = init_err;
+    diag->setup_err = setup_err;
+    diag->gpio_err = gpio_err;
+    diag->charging = (uint8_t) (battery_is_charging() == 1);
+    // Read both registers back from the hardware rather than trusting that the write happened.
+    // OUT alone is not enough: it reads 0 on a pin that was never made an output, which looks
+    // identical to a pin correctly driven low while the divider is actually switched off.
+    diag->read_enable = (uint8_t) nrf_gpio_pin_out_read(GPIO_BATTERY_READ_ENABLE);
+    diag->enable_is_output = (uint8_t) (nrf_gpio_pin_dir_get(GPIO_BATTERY_READ_ENABLE) == NRF_GPIO_PIN_DIR_OUTPUT);
+
+    // Switch the divider off and sample the other state. Zero in both states means nothing is
+    // arriving from BAT+ at all; a high reading here with zero when switched on would instead
+    // mean the resistors are fine and the switch is at fault. Restored immediately after.
+    if (gpio_pin_set(gpio_battery_dev, GPIO_BATTERY_READ_ENABLE, 0) == 0) {
+        k_msleep(2);
+        if (battery_measure(&off) == 0) {
+            diag->off_counts = off.raw_counts;
+        }
+        (void) battery_enable_read();
+        k_msleep(2);
+    }
+
+    ret = battery_measure(diag);
+    diag->read_err = last_read_err;
+
+    // Set up lazily, so the normal gauge path never pays for the control.
+    k_mutex_lock(&battery_mut, K_FOREVER);
+    (void) read_reference(ADC_VDD_CHANNEL, SAADC_CH_PSELP_PSELP_VDD, &diag->vdd_mv);
+    k_mutex_unlock(&battery_mut);
+
+    if (ret) {
+        return ret;
+    }
+
+    battery_get_percentage(&diag->percentage, diag->battery_mv < 0 ? 0 : (uint16_t) diag->battery_mv);
+    return 0;
 }
 
 int battery_get_percentage(uint8_t *battery_percentage, uint16_t battery_millivolt)
@@ -209,45 +348,58 @@ int battery_get_percentage(uint8_t *battery_percentage, uint16_t battery_millivo
 
 int battery_init()
 {
-    int ret = 0;
+    int gpio_ret;
 
     // ADC
     if (!device_is_ready(adc_battery_dev)) {
         LOG_ERR("ADC device not found!");
+        init_err = -EIO;
         return -EIO;
     }
 
-    ret |= adc_channel_setup(adc_battery_dev, &channel_7_cfg);
-
-    if (ret) {
-        LOG_ERR("ADC setup failed (error %d)", ret);
+    setup_err = (int8_t) adc_channel_setup(adc_battery_dev, &channel_7_cfg);
+    if (setup_err) {
+        LOG_ERR("ADC setup failed (error %d)", setup_err);
     }
 
     // GPIO
     if (!device_is_ready(gpio_battery_dev)) {
         LOG_ERR("GPIO device not found!");
+        init_err = -EIO;
         return -EIO;
     }
 
-    ret |= gpio_pin_configure(gpio_battery_dev, GPIO_BATTERY_CHARGING_ENABLE, GPIO_OUTPUT | GPIO_ACTIVE_LOW);
-    ret |= gpio_pin_configure(gpio_battery_dev, GPIO_BATTERY_READ_ENABLE, GPIO_OUTPUT | GPIO_ACTIVE_LOW);
-    ret |= gpio_pin_configure(gpio_battery_dev, GPIO_BATTERY_CHARGE_SPEED, GPIO_OUTPUT | GPIO_ACTIVE_LOW);
+    // ~CHG is an input: it is the charger reporting, not us commanding. The pull-up keeps it
+    // defined while the charger's open-drain output is released.
+    gpio_ret =
+        gpio_pin_configure(gpio_battery_dev, GPIO_BATTERY_CHARGE_STATUS, GPIO_INPUT | GPIO_PULL_UP | GPIO_ACTIVE_LOW);
+    // Driven low here rather than left to battery_enable_read(): GPIO_OUTPUT on its own leaves the
+    // level undefined until something sets it, which is a divider that is off for as long as it
+    // takes to notice.
+    gpio_ret |= gpio_pin_configure(gpio_battery_dev, GPIO_BATTERY_READ_ENABLE, GPIO_OUTPUT_ACTIVE | GPIO_ACTIVE_LOW);
+    gpio_ret |= gpio_pin_configure(gpio_battery_dev, GPIO_BATTERY_CHARGE_SPEED, GPIO_OUTPUT | GPIO_ACTIVE_LOW);
+    gpio_err = (int8_t) gpio_ret;
 
-    if (ret) {
-        LOG_ERR("GPIO configure failed!");
-        return ret;
-    }
-
-    if (ret) {
-        LOG_ERR("Initialization failed (error %d)", ret);
-        return ret;
+    if (gpio_ret) {
+        LOG_ERR("GPIO configure failed (error %d)", gpio_ret);
+        init_err = (int8_t) gpio_ret;
+        return gpio_ret;
     }
 
     is_initialized = true;
     LOG_INF("Initialized");
 
-    ret |= battery_enable_read();
-    ret |= battery_set_fast_charge();
+    // Enabling the divider is what makes the gauge work at all, so it must not be skipped just
+    // because the ADC channel setup complained. Previously a single accumulated `ret` carried the
+    // ADC result down here and returned early, leaving P0.31 floating and the reported percentage
+    // pinned to 0% or 100% depending on the sign of the noise -- with nothing to say why.
+    int enable_ret = battery_enable_read();
+    if (enable_ret) {
+        LOG_ERR("enabling the battery divider failed (error %d)", enable_ret);
+    }
+    int charge_ret = battery_set_fast_charge();
 
-    return ret;
+    init_err = (int8_t) (enable_ret ? enable_ret : (charge_ret ? charge_ret : setup_err));
+    LOG_INF("charger reports %s", battery_is_charging() == 1 ? "charging" : "not charging");
+    return init_err;
 }

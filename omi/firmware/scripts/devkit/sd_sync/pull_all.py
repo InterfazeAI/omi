@@ -36,6 +36,15 @@ STATE_VERSION = 1
 MAX_FUTILE_ATTEMPTS = 5
 RECONNECT_PAUSE_S = 5
 
+# Abandon a transfer that stops writing. The read loop has its own stall detection, but it can
+# only act while it is running: a hang inside the Bluetooth stack reports nothing and waits for
+# ever, which cost a two-hour pull once. Bytes landing on disk is the one signal that cannot lie,
+# and at ~16 KB/s a healthy transfer writes every second, so this only ever fires on a real hang.
+IDLE_LIMIT_S = 90
+WATCH_TICK_S = 5
+CONNECT_TIMEOUT_S = 60
+DISCONNECT_TIMEOUT_S = 15
+
 
 def part_path(out_dir, seq):
     return os.path.join(out_dir, f"seg-{seq:04d}.opus")
@@ -78,6 +87,38 @@ def on_disk(out_dir, part):
     except FileNotFoundError:
         return 0
     return min(size, part["expected"]) if part["expected"] else size
+
+
+def file_size(path):
+    try:
+        return os.path.getsize(path)
+    except FileNotFoundError:
+        return 0
+
+
+async def guard_progress(coro, path, idle_limit=IDLE_LIMIT_S):
+    """Run a transfer, abandoning it if `path` stops growing. Returns its result, or None if hung.
+
+    Watches the file rather than the transfer because the failure this exists for is the transfer
+    becoming unable to report anything at all.
+    """
+    task = asyncio.ensure_future(coro)
+    size, idle_since = file_size(path), time.monotonic()
+
+    while not task.done():
+        await asyncio.sleep(WATCH_TICK_S)
+        grown = file_size(path)
+        if grown != size:
+            size, idle_since = grown, time.monotonic()
+        elif time.monotonic() - idle_since >= idle_limit:
+            task.cancel()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+            return None
+
+    return await task
 
 
 def planned_bytes(part, segment_bytes):
@@ -157,11 +198,23 @@ async def fetch_part(client, info, state, out_dir, part, progress, done_elsewher
     print(f"\n  segment {number} (seq {seq}) -> {os.path.basename(path)}, {target}{resumed}")
 
     base = done_elsewhere + have
-    written, elapsed, reason = await omi_sd.download_to_file(
-        client, have, remaining, path, number,
-        on_progress=lambda got: progress.update(base + got))
+    began = time.time()
+    outcome = await guard_progress(
+        omi_sd.download_to_file(client, have, remaining, path, number,
+                                on_progress=lambda got: progress.update(base + got)),
+        path)
 
+    elapsed = time.time() - began
+    if outcome is None:
+        reason = "hung"
+        print(f"\n  nothing written for {IDLE_LIMIT_S}s; abandoning this link")
+    else:
+        _, elapsed, reason = outcome
+
+    # Measured from the file, not reported by the transfer: on a hang there is no report, and the
+    # bytes on disk are what actually survived either way.
     size = os.path.getsize(path)
+    written = size - have
     if expected is not None:
         if size >= expected:
             # The final notification can overshoot the cutoff; trim so the segment ends exactly
@@ -177,18 +230,23 @@ async def fetch_part(client, info, state, out_dir, part, progress, done_elsewher
     print(f"  segment {number}: +{omi_sd.format_size(written)} in "
           f"{omi_sd.format_duration(elapsed)}, {status}")
     save_state(out_dir, state)
+    if reason == "hung":
+        # The link is unusable and the client is mid-operation; get a fresh one rather than
+        # starting the next segment down a connection that has already stopped answering.
+        raise ConnectionError("transfer hung")
     return written
 
 
 async def transfer(state, out_dir):
-    """Connect and fetch whatever is still outstanding. Returns bytes moved this session."""
+    """Connect and fetch whatever is still outstanding."""
     device = await omi_sd.find_device()
     if not device:
         print("  device not found - is it advertising? a failed SD mount stops BLE entirely")
-        return 0
+        return
 
-    moved = 0
-    async with BleakClient(device, timeout=30.0) as client:
+    client = BleakClient(device, timeout=30.0)
+    await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT_S)
+    try:
         info = await omi_sd.read_info(client)
 
         total = sum(planned_bytes(p, state["segment_bytes"]) for p in state["parts"])
@@ -199,11 +257,16 @@ async def transfer(state, out_dir):
             if part["complete"]:
                 continue
             done_elsewhere = sum(on_disk(out_dir, p) for p in state["parts"] if p is not part)
-            moved += await fetch_part(client, info, state, out_dir, part,
-                                      progress, done_elsewhere)
+            await fetch_part(client, info, state, out_dir, part, progress, done_elsewhere)
 
         progress.finish(sum(on_disk(out_dir, p) for p in state["parts"]))
-    return moved
+    finally:
+        # Bounded for the same reason the transfer teardown is: disconnecting talks to a peer
+        # that may already have stopped answering, and this runs on the path where it has.
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_TIMEOUT_S)
+        except Exception:
+            print("  disconnect timed out; abandoning the link")
 
 
 def estimate_starts(state, decoded):
@@ -320,13 +383,16 @@ async def run(out_dir, decode_only):
             print(f"\n  giving up after {futile} attempts that moved nothing. "
                   f"Rerun to try again; nothing already fetched is lost.")
             return 1
+        # Measured from the files rather than reported by the session, so bytes still count when
+        # the session ends by throwing -- which is the normal way a dropped link ends.
+        before = sum(on_disk(out_dir, p) for p in state["parts"])
         try:
-            moved = await transfer(state, out_dir)
+            await transfer(state, out_dir)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            moved = 0
             print(f"\n  connection lost: {type(exc).__name__}: {exc}")
+        moved = sum(on_disk(out_dir, p) for p in state["parts"]) - before
         save_state(out_dir, state)
 
         if any(not p["complete"] for p in state["parts"]):

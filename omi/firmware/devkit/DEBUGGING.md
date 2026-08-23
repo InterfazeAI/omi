@@ -15,8 +15,28 @@ follows cost hours to find and is not obvious from the code.
   below the card slot, alongside RX and A1) routes chip select to the BFF's A0 edge pad, which
   already sits on the XIAO's A0/D0 pad in the stack. Same P0.02, so no firmware change — but that
   stack joint stops being merely structural and must be reflowed as a real electrical joint.
-- No speaker fitted; a latching switch in the battery line instead of the momentary button.
-  Build with `sd-on-no-button-speaker.conf` so the firmware does not wait on absent hardware.
+- No speaker and no haptic motor fitted. A momentary button bridges **D4 (P0.04) and D5 (P0.05)**:
+  D5 is held high by its internal pull-up and D4 is driven low as the return path, so a press pulls
+  D5 down. A button between D5 and GND works identically. Build with `sd-on-button-no-speaker.conf`.
+  Read Trap 17 before touching either pin — driving D4 high, which the firmware used to do, makes
+  the board behave exactly as if no button were fitted.
+
+  | Gesture | Effect |
+  |---|---|
+  | single tap | notify `1` on the button characteristic; nothing local |
+  | double tap | notify `2`; nothing local |
+  | triple tap | flush the card, drop BLE, `SYSTEMOFF`. Any press wakes it (via reset) |
+  | hold 2 s | LED turns **yellow** — a warning, still cancellable by letting go |
+  | hold 5 s | **erase every recording, then release the bond**, so another device can pair |
+
+  Taps are reported only after 600 ms of quiet, so the count is settled before anything is sent —
+  otherwise a triple would arrive as a single followed by a double, and the double is its own
+  gesture. The 5 s hold is the same `storage_request_unbond_wipe()` path as the BLE release
+  command, wipe first and bond second, and it is deliberately hard to reach by accident: the
+  erase is irreversible and there is no confirmation beyond the yellow LED.
+- Earlier boards used a latching switch in the battery line and no button at all; those build with
+  `sd-on-no-button-speaker.conf`, which keeps `CONFIG_OMI_ENABLE_BUTTON=n` so the unconnected D5
+  cannot float into a phantom long-press and switch the board off.
 - SPI is pinned to 8 MHz in `overlay/xiao_ble_sense_devkitv2-adafruit.overlay`. Dropping from
   24 MHz did **not** fix the `-EIO` failures it was meant to (see Trap 1) — it is kept only as
   margin for jumper wires, and is still far faster than the BLE link can drain.
@@ -30,8 +50,10 @@ docker run --rm -v "$(pwd)/omi:/omi" -e CMAKE_PREFIX_PATH=/opt/toolchains \
 ```
 
 `omi_build_diag.sh` is the same image plus `diag-threads.conf` (per-thread CPU accounting).
-`omi_build_secure.sh` is the same image plus `secure-pairing.conf`, which requires a paired,
-encrypted link for audio, recordings, the clock and DFU. `omi_build_unbond.sh` erases every bond at
+`omi_build_secure.sh` is the same image plus `sd-on-button-no-speaker.conf` and
+`secure-pairing.conf`, which requires a paired, encrypted link for audio, recordings, the clock and
+DFU. Swap the first fragment for `sd-on-no-button-speaker.conf` when building for a board with no
+button fitted. `omi_build_unbond.sh` erases every bond at
 boot; it is the recovery path when the bonded device is gone and cannot release the slot itself.
 
 Use the image tag above verbatim. `zephyr-build:v0.26.13` is **not** on this machine and asking for
@@ -45,6 +67,10 @@ macOS quirks waste time here:
 - The bootloader ejects the volume the moment it has the whole image, so the write **aborts
   with an I/O error on success**. Treat "volume disappeared" as the success signal, not the
   exit code.
+- Copying to a volume that has only just mounted fails with `fcopyfile failed: Device not
+  configured`, and unlike the case above this one is a real failure — the volume stays mounted and
+  `CURRENT.UF2` is unchanged. Recent macOS mounts these as `msdos ... fskit`; sleep ~3 s after the
+  volume appears and retry the copy. The identical `cp` succeeds on the next attempt.
 
 ## Traps
 
@@ -345,6 +371,241 @@ and serial was mute throughout — the SMP debug image does not even boot (it ha
 reason, before `watchdog_init()`, so no watchdog reset ever fires to reveal it). Trap 8 again: on
 this board, BLE is the only observation channel that works.
 
+### 13. A dead BLE link does not raise, it waits — and takes the host tool with it
+
+A whole-card pull sat for **2h16m** having written nothing, printed nothing and used 0.05 s of CPU.
+Not crashed, not retrying: blocked. The stall detection had worked perfectly ten seconds into the
+failure; what hung was the code that runs *after* it.
+
+Tearing a transfer down sends the device a STOP with `response=True`. On CoreBluetooth that waits
+for an acknowledgement from a peer which, in this situation, has already gone away — and bleak
+applies no timeout, so the wait is unbounded. Every symptom points at the transfer being stuck,
+while the transfer has actually finished and is stuck saying goodbye.
+
+The general rule: **on the failure path, every Bluetooth call needs its own timeout**, because that
+path runs precisely when the peer has stopped answering. Teardown, disconnect and reconnect are all
+this shape. A retry loop wrapped around an operation that can block for ever never gets to retry.
+
+Stall detection inside a read loop is also not enough on its own, because it cannot fire if the
+loop is not running. The durable guard watches the artefact instead: if the output file has not
+grown in 90 s, the transfer is abandoned and the link rebuilt, whatever layer is wedged. At
+~16 KB/s a living transfer writes every second, so it never triggers spuriously.
+
+Interrupted transfers must therefore be cheap. `pull_all.py` resumes from the length of its output
+file rounded down to the 440-byte block grid, so abandoning a wedged link costs at most a second of
+audio and never corrupts what is already down.
+
+### 14. The battery gauge reports 0% or 100% when it is not measuring at all
+
+This board's battery percentage alternated between 0% and 100% every 15 s, never anything between.
+Both are the clamps of the discharge curve: 100% at or above 4074 mV, 0% at or below 3000 mV. One
+noisy signal near zero was hitting opposite rails depending only on its sign.
+
+The sign flip came from this, in `battery_get_millivolt()`:
+
+```c
+*battery_millivolt = adc_mv * ((R1 + R2) / R2);   // adc_mv is int, target is uint16_t
+```
+
+The SAADC returns small negative values when its input floats. −1 mV becomes −3, wraps to 65533,
+and reports a **full** battery. A device that cannot measure its cell must never claim it is full,
+so the reading is now clamped at zero: still wrong, but wrong in the direction that gets noticed.
+
+The same line had a second defect, and it needs the history to read correctly. This driver is a
+fork of [Tjoms99/xiao_sense_nrf52840_battery_lib](https://github.com/Tjoms99/xiao_sense_nrf52840_battery_lib),
+which scales in floating point:
+
+```c
+float scale_factor = ((float)(R1 + R2)) / R2;   // R1 = 1037, measured against a meter
+*battery_millivolt = (uint16_t)(adc_mv * scale_factor);
+```
+
+The fork rewrote that as integer arithmetic, `adc_mv * ((R1 + R2) / R2)`, where the parenthesised
+ratio truncates *before* it is applied. With upstream's R1 it truncates 3.03 to 3 — near enough to
+look right, which is why it survived — but set R1 to its nominal 1000 and the same expression
+truncates 2.96 to **2**, silently discarding a third of the voltage. The bug is the ratio being
+computed as integers before the multiply, not the constant.
+
+Upstream's `R1 = 1037` is a genuine calibration against a meter, absorbing resistor tolerance, not
+a rounding fudge. It is also specific to their board, so this fork scales by the nominal 1510/510
+in a single `int32_t` expression instead; anyone wanting better accuracy on a board whose sense
+line works should re-measure and tune R1 the way upstream did.
+
+The two defects are plausibly the same defect. Upstream's binding defaults `adc-acquisition-time`
+to `0`, i.e. `ADC_ACQ_TIME_DEFAULT`, so their calibration was measured at the same 10 µs that
+undercharges the sampling capacitor and biases every reading low — and inflating R1 by 2.4% is
+precisely what hand-compensating for that produces. Established: both used the short acquisition
+time. Inferred: that this is what the calibration was absorbing. If you tune R1 on a working board,
+do it *after* setting a correct acquisition time, or you will re-derive the same fudge.
+
+`battery_init()` also accumulated every error into one `ret`, so a complaint from
+`adc_channel_setup()` survived to a later `if (ret) return`, skipping `battery_enable_read()` —
+leaving the divider off permanently because something unrelated failed. Errors are tracked
+separately now.
+
+**None of those were the fault here**, and the way that was established matters more than the
+answer. The diagnostics service exposes the numbers behind the percentage, which first gave:
+
+```
+  at the pin    0 mV   (1 raw counts)
+  divider       P0.14 LOW - enabled
+  errors        none
+```
+
+Divider switched in, no errors, nothing at the pin. That was called a hardware fault, and it was
+one — but the call was not yet supported, because **a zero proves nothing until something nonzero
+is measured beside it**. A dead pin, a converter that was never configured, a reference that reads
+nothing and an ADC pointed at the wrong input all produce this identical output. Three controls
+were needed before the reading meant anything:
+
+| Control | Result | Rules out |
+|---|---|---|
+| Board runs with USB unplugged | still advertising | BAT+ absent, cell flat, switch off |
+| Sample with the divider switched **off** too | also 0 counts | switch stuck, gate not driven |
+| Same ADC pointed at the 3.3 V rail | 3,295 mV | ADC, reference, gain, conversion maths |
+
+Only with all three does the zero at AIN7 carry information: the module's internal sense path is
+open, under the shield, unrepairable. The last control is the cheapest and the most valuable —
+`vdd_mv` needs no wiring, and had the ADC been misconfigured it would have turned a "hardware is
+broken" verdict into a firmware fix.
+
+Two further lessons. **A clamped output hides its own failure**: 0% looked like a flat battery for
+as long as it was sampled once, and only repeated sampling revealed the alternation that exposed
+the wrap. And **the reading is equally zero when the cell is simply switched out of circuit**, so
+on a board with a battery switch, confirm the cell is carrying the load before suspecting anything.
+
+**Do not retry `VDDHDIV5`.** The nRF52840's ADC can sample its own high-voltage supply pin
+pre-divided by five, and on a board running in high-voltage mode that pin is fed by the cell — a
+battery gauge with no divider, no enable and no wiring. This module is not such a board. It reads
+a stable 6,160 mV that is neither the 3.3 V rail nor a plausible cell voltage, and across a full
+USB removal it moved **3 mV**:
+
+```
+  on USB      6,158 mV  (n=5)
+  on cell     6,161 mV  (n=16)
+```
+
+VDDH is strapped to VDD, so `VDDHDIV5` is undefined in this mode and the value means nothing.
+Note that the absolute number is what makes this tempting and useless at the same time: it looks
+like a real measurement, is stable to 0.5%, and correlates with nothing. Only the before/after
+comparison settles it, which is the general rule — **a reading that never moves when its supposed
+source moves is not measuring that source**, however plausible it looks.
+
+That leaves an external divider from BAT+ to a free analog pin as the only route to a percentage
+on a board with this fault. A0/P0.02 is the SD card's chip select and A1/A2/A3 belong to the
+speaker's I2S; on a build without a speaker those are free.
+
+One thing short of that does work without hardware. VDD is regulated 3.3 V taken from the cell, so
+it stays flat while the battery falls — and then follows it down once the regulator drops out
+somewhere near 3.4 V. That is no use as a gauge, but it is a genuine "charge me now" signal
+available for free, at roughly the last 5% of the cell.
+
+### 15. P0.17 is the charger talking to you, not a switch you can throw
+
+The driver had `#define GPIO_BATTERY_CHARGING_ENABLE 17`, configured it `GPIO_OUTPUT`, and boot
+called `battery_charge_start()` to "start charging". Seeed's own board definition says otherwise:
+
+```
+ 13, // D22 is P0.13 (HICHG)   charge current select  -- an output, correctly used
+ 17, // D23 is P0.17 (~CHG)    charge status          -- an INPUT from the BQ25100
+```
+
+There is no enable. The BQ25100 charges whenever USB is present and decides on its own when to
+stop; P0.17 is its open-drain status output, low while charging. So the firmware spent every boot
+driving a push-pull output into the charger's output transistor, and in exchange threw away the
+only signal that separates "on USB and charging" from "running the cell down" — the exact
+information wanted here. It now reads as an input and reports over BLE.
+
+Upstream had this right and the fork broke it. `Tjoms99/xiao_sense_nrf52840_battery_lib` configures
+the same pin `GPIO_INPUT | GPIO_ACTIVE_LOW` with an edge interrupt and exposes
+`battery_is_charging()`; only the *name* `charging_enable` was ever misleading. Somewhere in
+forking, the name was believed over the configuration, the direction was flipped to match it, and
+`battery_charge_start()`/`battery_charge_stop()` were invented to drive a pin that commands
+nothing.
+
+Nothing detected it, and nothing could have: the code compiled, the pin toggled, the charger
+carried on charging regardless, and the name made it read as correct at every review. Two things
+to carry — **a GPIO's direction is a claim about the hardware, so check it against the vendor's
+board definition** (for this module, `g_ADigitalPinMap` in `variant.cpp` of Seeed's Arduino core),
+and **when a fork's behaviour is puzzling, diff it against upstream before theorising**. Both
+defects in Trap 14 and 15 are fork regressions, and the diff would have found them in minutes.
+
+### 16. A connected board is invisible to a scan, and bonding makes that permanent
+
+Every host tool locates the board by scanning for its service UUID. After a tool exits uncleanly,
+the next one can sit at `...rescanning` for ever while the board is powered, healthy, and happily
+answering — because **a BLE peripheral stops advertising the moment it accepts a connection**.
+There is nothing to scan for.
+
+Three states get conflated, and only the middle one is the problem:
+
+| State | Meaning |
+|---|---|
+| paired | the host has stored keys; survives reboots, unrelated to radio activity |
+| connected | a link is up right now — **and advertising is therefore off** |
+| advertising | broadcasting, so a scan can find it |
+
+Bonding turns a transient failure into a stuck one. macOS re-establishes the link to a bonded
+peripheral on its own, so a crashed tool leaves the board connected to `bluetoothd` with no client
+using it. It will never advertise again until something drops that link. An *unpaired* board
+recovers by itself, which is why this only shows up after secure pairing is enabled.
+
+Confirm with `blueutil --connected`; the board appears there while every scan comes up empty:
+
+```
+address: f4-e3-be-01-d2-d7, connected (master, 0 dBm), paired, name: "Omi DevKit 2"
+```
+
+The fix is not to disconnect it but to stop scanning: connecting by address attaches to the
+existing link. `find_device()` now caches the last address and tries it before scanning, and
+prints the above as a hint when a scan comes up empty. Note that "connect to it directly" is
+counter-intuitive precisely when the tool reports it cannot find the device.
+
+### 17. The button needs a ground, not a supply — and D4 was driving 3.3 V into it
+
+Two separate defects here, and they hide each other. Both come from the same misreading: that
+`d4_pin` supplies the button. The press logic says otherwise —
+
+```c
+int temp = gpio_pin_get_raw(dev, d5_pin_input.pin);
+if (temp) { was_pressed = false; } else { was_pressed = true; }
+```
+
+low is pressed. **An active-low input needs the button to pull it down**, so the far side has to
+be a ground. The `// 3.3` comment next to `d4_pin` reads as helpful and is the whole problem.
+
+*Defect one — the pin floated.* D5 was configured `GPIO_INPUT` with no pull, so at rest it drifted
+low on its own, and three seconds of that is `LONG_PRESS_TIME`. The board called `SYSTEMOFF` at
+random. It got diagnosed as a power fault and `CONFIG_OMI_ENABLE_BUTTON=n` was set on the devkit
+build, which buried the real bug for as long as the button stayed off.
+
+*Defect two — D4 was driven high.* With the pull-up added and a button wired between D4 and D5
+(the arrangement the assembly guide's photos show), pressing shorts high to high. The pin never
+moves, the `GPIO_INT_EDGE_BOTH` interrupt never fires, `was_pressed` is never set, and the 25 Hz
+FSM sees a button that is never pressed. Not a flaky button — **a board that behaves exactly as
+if it has no button fitted**, which is the hardest failure to attribute.
+
+The fix is one line each: pull D5 up, and drive D4 *low* so it is a ground. That supports a button
+wired D4-to-D5 **and** one wired D5-to-GND, because D4 low is just an unused pin in the second
+case. Verified end to end — single tap (code 1) and double tap (code 2) over the button
+characteristic, a 3 s hold powering the board down, a press waking it, and `info.py` reporting
+`no open or write failures` afterwards, so the `sd_off()` flush survives the shutdown. The wake
+also settles a datasheet question: **GPIO output state is retained through System OFF**, so D4
+keeps sinking while the chip sleeps.
+
+While in the file, `dt_flags` held `GPIO_OUTPUT_ACTIVE` and `GPIO_INT_EDGE_RISING`. That field is
+16 bits and carries only devicetree-level flags; both constants live above bit 16, so both
+truncated to `0` with a `-Woverflow` the build had always printed. Active high is what the code
+assumes, so it worked — by accident. They are now written as `0`, and the real flags are passed to
+the `gpio_pin_configure_dt()` / `gpio_pin_interrupt_configure_dt()` calls where they belong.
+
+One lesson about the *diagnosis*, not the bug. The ISR logs every edge with `LOG_PRINTK`, so an
+empty console looked like proof that no edge arrived. It was not: this build sets
+`CONFIG_LOG_DEFAULT_LEVEL=0`, and nothing had confirmed that path could emit anything at all — the
+boot banner that *did* appear is raw `printk`, a different route. **Silence from a probe you have
+never seen succeed is not evidence.** The BLE notification was the trustworthy signal, because the
+characteristic's presence had already been confirmed by reading the service list.
+
 ## Measured Baselines
 
 Use these to tell "slow" from "broken" without re-deriving them.
@@ -501,6 +762,30 @@ It exposes counters and error codes only, never content.
 
 Reason 9 (`unspecified`) with the level stuck at 1 and an empty bond slot is the Trap 12 signature.
 
+### Diagnostics service `19b10050-e8f2-537e-4f6c-d104768A1214`
+
+`19b10051` — battery, 26 bytes, read, unencrypted, layout version 5. The Battery Service reports one number
+and cannot say why it is wrong; this reports its inputs and the controls that make them
+admissible. See Trap 14.
+
+| Offset | Type | Meaning |
+|---|---|---|
+| 0 | `u8` | layout version, currently 5 |
+| 1 | `u8` | P0.14 OUT register: 0 = we are driving the divider on |
+| 2 | `i16` | averaged raw ADC counts, signed |
+| 4 | `i32` | millivolts at the ADC pin |
+| 8 | `i32` | millivolts after the divider ratio, before clamping |
+| 12 | `u8` | percentage the gauge would report |
+| 13..17 | `i8` | errors: init, adc setup, gpio, adc read, this call |
+| 18 | `i16` | counts with the divider switched **off** |
+| 20 | `u8` | P0.14 DIR register: 0 means the drive above never happened |
+| 21 | `u8` | P0.17 `~CHG`: 1 = charging |
+| 22 | `i32` | same ADC pointed at the 3.3 V rail — the control |
+
+Counts are signed on purpose: a floating input reads slightly negative, and that sign is the
+difference between "no measurement" and "full battery". Offsets 18 and 22 exist because a zero at
+offset 2 is meaningless on its own — see the control table in Trap 14.
+
 `19b10042` — release, write, **encrypted**. Write exactly the eight bytes `OMIUNBND` to give up the
 bond slot so another device can pair. Encrypted because only the current owner may hand the device
 over; the magic exists so a truncated or stray write cannot orphan the board.
@@ -519,8 +804,17 @@ The wipe must complete **before** the bond is released. Losing power midway then
 intact, so no new device can pair and read what survived; releasing first would open exactly that
 window.
 
-This is the normal way to change owner. `omi_build_unbond.sh` remains the recovery path for when
-the bonded device is lost or broken and can no longer ask.
+This is the normal way to change owner. **Holding the button for 5 seconds does the same thing**,
+entering at step 2 rather than step 1, which is what makes it useful: the BLE command is encrypted
+so only the current owner can send it, and a board whose owner is gone cannot be handed on that
+way. `omi_build_unbond.sh` remains the recovery path for a board with no button fitted.
+
+Measured across a real button reset: bonds `1/1` → `0/1`, link `encrypted level 2` → `plain
+level 1`, card `4 segments / 195,072,616 bytes` → `1 segment / 352,000 bytes` and already
+recording again. Note the aftermath — the board advertises normally but **every connection
+attempt disconnects immediately** until the host re-pairs, because the host still holds a key the
+board has thrown away. That looks like a broken board and is not one; `pairing.py --pair` clears
+it.
 
 ## Host Tools
 
@@ -533,6 +827,8 @@ python3 pull_all.py ~/Desktop/omi-archive           # the whole card, resumable
 python3 record_and_pull.py 60 ~/Desktop/take1.wav   # record a window, pull it back
 python3 pull_range.py <start> <len> [out.wav] [seg] # re-decode a span already on the card
 python3 throughput.py 25                            # sync speed; ~14-16 KB/s is healthy
+python3 battery.py                                  # level, and the measurement behind it
+python3 battery.py --watch 10                       # does the reading track a charging cell?
 python3 pairing.py                                  # bond slots, pairing errors (works unpaired)
 python3 pairing.py --pair                           # trigger the host's pairing prompt
 python3 pairing.py --release                        # hand the bond slot to a new device
