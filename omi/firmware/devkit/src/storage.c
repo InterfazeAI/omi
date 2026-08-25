@@ -148,14 +148,10 @@ static ssize_t storage_read_characteristic(struct bt_conn *conn,
 
 uint8_t transport_started = 0;
 
-static uint16_t packet_next_index = 0;
 #define SD_BLE_SIZE 440
 static uint8_t storage_write_buffer[SD_BLE_SIZE];
 
 static uint32_t offset = 0;
-static uint8_t index = 0;
-static uint8_t current_packet_size = 0;
-static uint8_t tx_buffer_size = 0;
 static uint8_t stop_started = 0;
 static uint8_t delete_started = 0;
 static uint8_t current_read_num = 1;
@@ -222,6 +218,7 @@ static int setup_storage_tx()
 uint8_t delete_num = 0;
 uint8_t nuke_started = 0;
 static volatile uint8_t unbond_wipe_started = 0;
+volatile uint8_t storage_unbond_done_blinks = 0;
 static uint8_t heartbeat_count = 0;
 
 void storage_request_unbond_wipe(void)
@@ -309,32 +306,6 @@ static ssize_t storage_write_handler(struct bt_conn *conn,
     return len;
 }
 
-// static void write_to_gatt(struct bt_conn *conn)
-// {
-//     uint32_t id = packet_next_index++;
-//     index = 0;
-//     storage_write_buffer[0] = id & 0xFF;
-//     storage_write_buffer[1] = (id >> 8) & 0xFF;
-//     storage_write_buffer[2] = index;
-
-//     const uint32_t packet_size = MIN(remaining_length,OPUS_ENTRY_LENGTH);
-
-//     int r = read_audio_data(storage_write_buffer+FRAME_PREFIX_LENGTH,packet_size,offset);
-//     offset = offset + packet_size;
-
-//     index++;
-
-//     int err = bt_gatt_notify(conn, &storage_service.attrs[1], &storage_write_buffer,packet_size+FRAME_PREFIX_LENGTH);
-//     if (err)
-//     {
-//         LOG_PRINTK("error writing to gatt: %d\n",err);
-//     }
-//     else
-//     {
-//     remaining_length = remaining_length - OPUS_ENTRY_LENGTH;
-//     }
-// }
-
 static void write_to_gatt(struct bt_conn *conn)
 { // unsafe. designed for max speeds. udp?
 
@@ -400,6 +371,12 @@ void storage_write(void)
             save_offset(0);
             unbond_wipe_started = 0;
             transport_finish_unbond();
+
+            // Three red blinks -- six half-cycles of the 500 ms LED refresh -- confirming both
+            // halves landed. The gesture is irreversible and otherwise silent once the yellow
+            // warning clears, which leaves no way to tell a completed erase from a hold that was
+            // let go a moment too early.
+            storage_unbond_done_blinks = 6;
         }
         // Time sync arrives on the BT RX thread, which cannot write the record itself.
         storage_index_service();
@@ -437,7 +414,12 @@ void storage_write(void)
                 } else {
                     LOG_PRINTK("done. attempting to download more files\n");
                     uint8_t stop_result[1] = {END_OF_TRANSFER};
+                    // This is the only signal the host gets that a transfer finished. Dropping it
+                    // silently is what a stalled pull looks like from the other end, so say so.
                     int err = bt_gatt_notify(get_current_connection(), &storage_service.attrs[1], &stop_result, 1);
+                    if (err) {
+                        LOG_ERR("failed to notify end of transfer: %d", err);
+                    }
                     k_sleep(K_MSEC(10));
                 }
             }

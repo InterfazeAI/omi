@@ -106,6 +106,7 @@ struct battery_diag {
     int16_t off_counts;       /**< counts with the divider switched off -- see below */
     int32_t vdd_mv;           /**< same ADC pointed at the 3.3V supply: the control, see below */
     uint8_t charging;         /**< P0.17 (~CHG) from the BQ25100: 1 = charging */
+    uint16_t boot_mv;         /**< what the boot gate measured before any load came up; 0 if it did not run */
     int8_t init_err;          /**< result of the last battery_init() */
     int8_t setup_err;         /**< result of adc_channel_setup() during init */
     int8_t gpio_err;          /**< result of configuring the three control pins */
@@ -116,5 +117,19 @@ struct battery_diag {
  * @brief Fill in a snapshot of the gauge's inputs. Performs a fresh ADC read.
  */
 int battery_get_diagnostics(struct battery_diag *diag);
+
+/**
+ * @brief Record the voltage the boot gate measured, before the radio, mic and card came up.
+ *
+ * Exists to make the gate's threshold answerable with evidence rather than argument. The threshold
+ * has to sit above the runtime shutdown threshold by however much the cell sags under load, and
+ * that figure was assumed rather than measured when the gate was written. Reading this alongside
+ * the running voltage on the same charge gives the difference directly: boot_mv is taken with
+ * essentially nothing switched on, the running value with everything.
+ *
+ * Reported over BLE because the interesting case -- waking after a low-battery shutdown -- happens
+ * on battery, where there is no USB console to print to.
+ */
+void battery_note_boot_reading(uint16_t mv);
 
 #endif

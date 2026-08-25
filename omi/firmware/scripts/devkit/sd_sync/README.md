@@ -97,8 +97,47 @@ well as on, which separates an open resistor from a switch that is not switching
 3.3 V rail through the same ADC, which proves the converter works before any zero is blamed on the
 wiring. A zero reading means nothing without that last one.
 
-Before concluding anything from 0%, make sure the battery is actually switched into circuit: with
-the cell cut off and the board on USB, the reading is legitimately zero.
+Before concluding anything from 0%, check `divider off`. That is the tap sampled with the low-side
+switch open, so an intact divider with a cell behind it floats up near the rail (~4,000 counts). If
+**both** the enabled and disabled readings are zero, BAT+ is not reaching the module at all, and
+the thing to inspect is the battery joint — not the module.
+
+That distinction cost real time here: a zero on this board was read as an open resistor under the
+shield and written off as unrepairable. It was the BAT+ wiring. Note that the board running on
+battery does not rule this out, because it can be powered through a route that never touches the
+BAT+ pad the divider taps. See `devkit/DEBUGGING.md` trap 14.
+
+**Expect roughly 40 hours** on a full charge while recording continuously with BLE advertising.
+Do not estimate it from a short `--watch` run near full: the cell drops about 26 mV/h between
+4.0 and 3.8 V but only 12 mV/h across the long 3.8–3.5 V plateau, so a couple of hours of samples
+predicts about a day and is wrong by nearly half. Single samples also jitter about ±40 mV, which
+on that plateau is worth more than three hours of real discharge — read the trend, never a
+reading. Running a cell all the way to cutoff while recording is what destroyed a card's
+filesystem in trap 18; the firmware now shuts down at 3,420 mV to avoid repeating it.
+
+**The percentage now means percent of runtime remaining**, rebuilt from the 1,333-sample discharge
+above rather than the generic cell profile it shipped with. That profile put empty at 3,000 mV,
+several hundred millivolts below where this board's regulator actually drops out, so its bottom
+entries (5%, 2%, 1%, 0%) described voltages the hardware never reaches: the reading drifted to
+roughly 10% and the board then stopped. It also read *low* through the middle, reporting 50% at
+3,756 mV where about three quarters of the runtime remained. Both are fixed. It is still one cell
+at one temperature, so treat it as a good guide rather than a fuel gauge.
+
+`battery.py` also prints a **load sag** line — the difference between the voltage sampled at boot,
+before the radio, mic and card start, and the voltage now. That is the margin the low-battery boot
+gate is sized against, and it measured **22 mV** (3,853 → 3,831 mV) against a 50 mV margin. Expect
+more than that on a nearly flat cell, where internal resistance is higher. It reads
+`not measured this boot` on USB, since charging skips the gate; unplug and reset to get a number.
+
+**If the board seems dead after a flat battery, watch the LED before assuming the worst.** Three
+yellow blinks followed by darkness is the boot gate refusing to start on a cell that cannot sustain
+a write — it deliberately does not mount the card. Charge it and it boots normally. A steady yellow
+blink while running means the same thing earlier: below 3,500 mV, charge it soon. Red is recording,
+never battery.
+
+The one other blink worth knowing: **three red blinks after a 5-second button hold** confirm the
+erase-and-unbond finished. They fire when the wipe has actually completed, not when you let go, so
+no blinks means nothing was erased.
 
 ## Pairing
 

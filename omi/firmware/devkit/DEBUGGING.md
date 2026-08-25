@@ -28,12 +28,38 @@ follows cost hours to find and is not obvious from the code.
   | triple tap | flush the card, drop BLE, `SYSTEMOFF`. Any press wakes it (via reset) |
   | hold 2 s | LED turns **yellow** — a warning, still cancellable by letting go |
   | hold 5 s | **erase every recording, then release the bond**, so another device can pair |
+  | (after the 5 s hold) | **three red blinks** once the erase and unbond have actually finished |
 
   Taps are reported only after 600 ms of quiet, so the count is settled before anything is sent —
   otherwise a triple would arrive as a single followed by a double, and the double is its own
   gesture. The 5 s hold is the same `storage_request_unbond_wipe()` path as the BLE release
   command, wipe first and bond second, and it is deliberately hard to reach by accident: the
-  erase is irreversible and there is no confirmation beyond the yellow LED.
+  erase is irreversible and there is no confirmation beyond the yellow LED and the three red blinks
+  that follow it.
+
+  Those blinks are driven from the storage thread at the point the erase and the unbond have both
+  landed, **not** from the button release. The button handler only raises a flag; clearing a full
+  card takes long enough to matter, so confirming at release would confirm something that had not
+  happened yet — the worst possible signal for an irreversible operation. If you let go and see no
+  red blinks, the hold was short and nothing was erased.
+- **LED colours mean one thing each.** Red is recording, never battery — that separation is the
+  point, because a steady red and a blinking red are not a distinction anyone can rely on in the
+  field. Anything to do with the battery is yellow (red + green together).
+
+  | LED | Meaning |
+  |---|---|
+  | red, green, blue, white in sequence | boot LED sequence, ~3 s, every boot |
+  | blue steady | recording, BLE connected |
+  | red steady | recording, no BLE connection |
+  | green blink | charger active |
+  | **yellow blink, ~1 Hz** | battery below 3,500 mV — charge it soon |
+  | **yellow ×3, then dark** | boot gate refused to start; cell too flat to mount the card safely |
+  | yellow steady while holding the button | unbond warning, cancellable by letting go |
+  | **red ×3 after a 5 s hold** | erase and unbond completed — the only confirmation the wipe ran |
+
+  Yellow-then-dark at boot is the one most likely to be misread as a broken board. It is the gate in
+  trap 19 declining to open a file handle on a cell that cannot sustain the write; charge it and it
+  boots normally.
 - Earlier boards used a latching switch in the battery line and no button at all; those build with
   `sd-on-no-button-speaker.conf`, which keeps `CONFIG_OMI_ENABLE_BUTTON=n` so the unconnected D5
   cannot float into a phantom long-press and switch the board off.
@@ -452,27 +478,50 @@ answer. The diagnostics service exposes the numbers behind the percentage, which
   errors        none
 ```
 
-Divider switched in, no errors, nothing at the pin. That was called a hardware fault, and it was
-one — but the call was not yet supported, because **a zero proves nothing until something nonzero
-is measured beside it**. A dead pin, a converter that was never configured, a reference that reads
-nothing and an ADC pointed at the wrong input all produce this identical output. Three controls
-were needed before the reading meant anything:
+Divider switched in, no errors, nothing at the pin. Three controls were run before calling it:
 
 | Control | Result | Rules out |
 |---|---|---|
-| Board runs with USB unplugged | still advertising | BAT+ absent, cell flat, switch off |
+| Board runs with USB unplugged | still advertising | cell flat, switch off |
 | Sample with the divider switched **off** too | also 0 counts | switch stuck, gate not driven |
 | Same ADC pointed at the 3.3 V rail | 3,295 mV | ADC, reference, gain, conversion maths |
 
-Only with all three does the zero at AIN7 carry information: the module's internal sense path is
-open, under the shield, unrepairable. The last control is the cheapest and the most valuable —
-`vdd_mv` needs no wiring, and had the ADC been misconfigured it would have turned a "hardware is
-broken" verdict into a firmware fix.
+The verdict was that the module's internal sense path was open, under the shield, unrepairable.
 
-Two further lessons. **A clamped output hides its own failure**: 0% looked like a flat battery for
-as long as it was sampled once, and only repeated sampling revealed the alternation that exposed
-the wrap. And **the reading is equally zero when the cell is simply switched out of circuit**, so
-on a board with a battery switch, confirm the cell is carrying the load before suspecting anything.
+**That verdict was wrong.** Fitting the power button meant taking the switch out of the BAT+ line
+and resoldering the battery leads. With no firmware change at all, the same build then read the
+cell perfectly:
+
+```
+  computed      3,991 mV -> 91%
+  at the pin    1,348 mV   (1,534 raw counts)
+  divider off   4,006 raw counts
+```
+
+1,348 mV × (1000+510)/510 = 3,991 mV, matching a multimeter on the cell. Remaking the BAT+ joint
+is the only thing that changed, so that joint was the fault — the sense path under the shield was
+never open. Whether the old joint was cold or simply landed somewhere that powered the regulator
+without reaching the BAT+ pad was not established, and does not matter: either way the break was
+outside the module, on a pad reachable with an iron.
+
+The bad control is the first row. **"The board runs on battery" does not prove BAT+ reaches the
+divider** — those are different nets. Power the module through any other route into the regulator
+and it runs happily while the BAT+ pad, which is the only thing the internal divider taps, sits
+disconnected. The control felt conclusive because the board was visibly alive on the cell, and it
+established the cell was doing work, not that it was doing work *at the pin being measured*.
+
+The second row was misread rather than wrong, and it is the tell. `off_counts` is the tap sampled
+with the low-side switch open, so an intact divider floats it up toward BAT+ — about 4,000 counts,
+as above. It read **0**. An open high-side resistor and an absent BAT+ both zero the enabled
+reading, but only an absent BAT+ zeroes the disabled one too. That distinction was available in
+the data from the first measurement and went unnoticed, because the number was collected to check
+the switch rather than to locate the break.
+
+The general form is worth keeping: **a control only excludes what it actually varies.** Two
+independent readings agreeing on zero looked like corroboration and were the same fact twice.
+
+Also note **a clamped output hides its own failure**: 0% looked like a flat battery for as long as
+it was sampled once, and only repeated sampling revealed the alternation that exposed the wrap.
 
 **Do not retry `VDDHDIV5`.** The nRF52840's ADC can sample its own high-voltage supply pin
 pre-divided by five, and on a board running in high-voltage mode that pin is fed by the cell — a
@@ -491,14 +540,64 @@ like a real measurement, is stable to 0.5%, and correlates with nothing. Only th
 comparison settles it, which is the general rule — **a reading that never moves when its supposed
 source moves is not measuring that source**, however plausible it looks.
 
-That leaves an external divider from BAT+ to a free analog pin as the only route to a percentage
-on a board with this fault. A0/P0.02 is the SD card's chip select and A1/A2/A3 belong to the
-speaker's I2S; on a build without a speaker those are free.
+With BAT+ landed correctly the built-in gauge is sufficient and no external divider is needed. If
+a future board does read zero here, check the BAT+ joint and `off_counts` before suspecting the
+module: `off_counts` near the rail means the divider is intact and the cell is present.
 
-One thing short of that does work without hardware. VDD is regulated 3.3 V taken from the cell, so
-it stays flat while the battery falls — and then follows it down once the regulator drops out
-somewhere near 3.4 V. That is no use as a gauge, but it is a genuine "charge me now" signal
-available for free, at roughly the last 5% of the cell.
+**Measured drain**, run to death (`battery.py --watch`, recording continuously to SD, BLE
+advertising, no USB, 1,347 samples across three sessions):
+
+```
+  4,020 -> 3,813 mV  over  8.0 h   -26 mV/h   upper region, near-linear
+  3,795 -> 3,505 mV  over 23.9 h   -12 mV/h   plateau, less than half the rate
+  3,484 -> 3,455 mV  over  3.1 h              knee, jitter swamps the trend
+  then to cutoff unmonitored                  ~40 h total on one charge
+```
+
+**The rate is not constant, and the first session is the misleading one.** Extrapolating the
+-26 mV/h upper slope predicted about a day; the cell actually ran ~40 h, because it spends most of
+its life on the 3.8–3.5 V plateau draining at less than half that rate. A discharge curve measured
+only near full will always underestimate runtime this way. Do not fit one line to a Li-ion cell.
+
+VDD across the whole run stayed within 3,293–3,309 mV — flat to within its own noise against a
+565 mV cell swing, confirming it is worthless as a gauge until the regulator drops out near 3.4 V.
+
+**Single samples jitter about ±40 mV**, visible as the scatter around the trend. On the plateau
+that jitter is worth more than three hours of real discharge, so a single reading cannot place the
+cell on the curve at all. Anything thresholded — a low-battery LED, an automatic shutdown — needs a
+rolling mean and repeated confirmation, not one sample; `battery_guard()` in `main.c` averages 8
+readings and requires 3 consecutive strikes below 3,420 mV for exactly this reason.
+
+**The gauge's bottom four table entries described voltages this board cannot reach.**
+`battery_states[]` in `battery.c` *was* a generic "1S 250mAh LiPo discharge profile", not a
+measurement of this hardware, and stitching the three drain logs (1,333 samples) against it shows
+where that broke. Logging stopped at 3,455 mV with the board still running and the cell was flat
+6.5 h later, so at the measured knee rate of 18.9 mV/h collapse happened between 3,330 and
+3,390 mV:
+
+```
+  3,437 mV = fw 10%   0.9 h past the last sample   reachable
+  3,346 mV = fw  5%   5.8 h                        at the very edge of the window
+  3,255 mV = fw  2%  10.6 h                        cannot happen
+  3,164 mV = fw  1%  15.4 h                        cannot happen
+  3,000 mV = fw  0%  24.0 h                        cannot happen
+```
+
+VDD corroborates the floor independently: it held 3,293–3,309 mV across the entire 565 mV cell
+swing and never sagged, so what ends the run is the 3.3 V rail plus regulator dropout, not the
+chemistry. **In practice the gauge drifted to roughly 10% and the board then died without ever
+counting through 5, 2, 1.** The same fit shows it also read *low* through the middle of the
+discharge — 50% reported at 3,756 mV where about 75% of the runtime actually remained — with the
+two curves crossing near 20%.
+
+`battery_states[]` has since been **rebuilt from those 1,333 samples**, expressed as percent of
+runtime remaining (the load is constant, so charge burned tracks elapsed time) with 0% placed at the
+observed 3,400 mV cutoff instead of a nominal 3,000 mV empty. The reading now falls to zero at about
+the moment the board stops, and tracks runtime through the middle rather than under-reporting it.
+Three caveats survive the rewrite: it is one cell at one temperature, the bottom is bounded by the
+6.5 h window in which it died unmonitored, and everything above 4,020 mV is extrapolated because
+that is where logging began. Nothing safety-critical consumes it — `battery_guard()` and
+`battery_boot_gate()` both work in millivolts — so the cost of being wrong here is display accuracy.
 
 ### 15. P0.17 is the charger talking to you, not a switch you can throw
 
@@ -605,6 +704,167 @@ empty console looked like proof that no edge arrived. It was not: this build set
 boot banner that *did* appear is raw `printk`, a different route. **Silence from a probe you have
 never seen succeed is not evidence.** The BLE notification was the trustworthy signal, because the
 characteristic's presence had already been confirmed by reading the service list.
+
+### 18. A flat battery erased the filesystem, and `return err` turned that into a brick
+
+Two failures in series, and the second one is much worse than the first.
+
+*What the cell did.* The drain test above was allowed to run to cutoff while recording. Power
+collapsed during a write, and the card came back unmountable. Imaging it with `dd` and reading the
+image directly showed why:
+
+```
+  first 4 MiB   erased      boot sector and both FAT copies gone
+  beyond that   intact      directory entries and audio data still readable
+```
+
+Nothing corrupted a file. **SD cards erase in blocks far larger than a sector** — 4 MiB on this
+one — so appending to a file rewrites a FAT sector, which makes the controller erase and rewrite
+the entire block containing it. Lose power inside that window and the whole block comes back
+blank. The FAT region lives at the start of the volume, so a single interrupted metadata write
+destroys the filesystem rather than the file being written. The audio was never the fragile part.
+
+`FS_MOUNT_FLAG_NO_FORMAT` earned its place here: `CONFIG_FS_FATFS_MOUNT_MKFS` is on, so without
+that flag the next boot would have silently reformatted the card and erased the evidence along
+with the recordings. Recovery is to image the card first (`dd`), then reformat FAT32/MBR.
+
+*What the firmware did with it, which is the real trap.* The board then reset every 30 seconds,
+forever. `main()` ended each init step with `return err`, and the watchdog is started early while
+**only main's final loop feeds it**. Returning from `main()` does not halt anything visible — the
+RTOS keeps running, nothing feeds the dog, and 30 s later the board resets and does it all again.
+
+So an unreadable SD card, which should at worst disable recording, took out Bluetooth, the console
+and the battery gauge with it. **A reset loop cannot be asked what is wrong**: it never stays up
+long enough to advertise, and the CDC port disappears mid-sentence. The cost of the failure had
+nothing to do with its severity and everything to do with it removing the means of observing it.
+
+The fix is that init failures are recorded, not returned. `note_boot_fault()` keeps the first one
+and initialisation continues; the banner reports `Device initialized DEGRADED: <what> (err N)`
+instead of `successfully`. A board with no working card now boots, streams live audio, and answers
+diagnostics — which is exactly how you find out why the card is missing. Verified with the card
+physically removed: stayed up indefinitely, answered 9 services over BLE, reported 3,686 mV / 43%.
+
+The complementary fix is to not arrive here at all. `battery_guard()` averages 8 samples every
+10 s and calls `turnoff_all()` after 3 consecutive strikes below 3,420 mV, so the card is flushed
+and unmounted while the cell can still support a write, rather than collapsing mid-erase. See
+trap 19 for why that guard alone is not enough.
+
+Generalising past this board: **any init path that can fail needs to decide between "degrade" and
+"stop", and "stop" must never mean "return into a watchdog"**. If a peripheral is not required to
+diagnose the device, its failure must not be able to take the diagnostic path down with it.
+
+### 19. A guard that protects a running board does not protect the first two minutes of one
+
+`battery_guard()` closed the hole in trap 18 while the board is up. It cannot close it at boot, and
+the gap was wide enough to drive a filesystem through.
+
+Waking from `SYSTEMOFF` is a **reset**, not a resume, so every static in the guard starts empty
+again. It needs 8 samples at 10 s intervals before its average means anything, then 3 strikes — so
+**110 seconds during which no shutdown is possible**, on top of boot time. `battery_low` is unset
+for the same reason, so the warning LED stays dark too. It looks exactly like a healthy boot.
+
+What makes that reachable rather than theoretical is that the cell *recovers*. `SYSTEMOFF` drops the
+load to about a microamp, and an unloaded cell climbs back over the following minutes. So the next
+button press sees a healthier voltage, boots, mounts the card, opens a segment for append — and sags
+straight back under load. Each press buys roughly two minutes of recording onto a cell at the edge
+of brownout.
+**Repeated button presses on a flat battery were the most likely way to destroy another card**, and
+the behaviour invites exactly that, because a board that shuts down looks like one that needs
+turning on again.
+
+The upstream code had already noticed the shape of this without acting on it — `turnoff_all()`
+carried the comment *"maybe save something here to indicate success. next time the button is pressed
+we should know about it"*.
+
+The fix is `battery_boot_gate()` in `main.c`, placed deliberately between `button_init()` (so
+`enter_system_off()` has a wake source to arm) and `mount_sd_card()` (the resource being protected).
+It takes 8 **consecutive** readings rather than spaced ones — nothing is loading the board yet, so
+the whole check costs milliseconds instead of 80 s — and if the rested average is below 3,470 mV and
+the charger is idle, it blinks yellow three times and powers off without ever touching the card.
+
+**The threshold was first written as 3,450 mV and justified by a number that was never measured.**
+The note here claimed 50–100 mV of rest recovery while the constant sat only 30 mV above the runtime
+3,420 mV — the justification contradicted the value it was justifying. Working from the actual load
+makes the quoted figure worse, not better: the board averages about 6 mA, so the resistive part of
+the sag is single-digit millivolts, and what recovery exists comes from slower diffusion relaxation,
+tens of millivolts at most. 3,470 mV gives 50 mV of margin, which covers that without refusing cells
+that still hold hours.
+
+Rather than leave that as another estimate, the gate now records what it measured and
+`battery_get_diagnostics()` reports it as `boot_mv` (payload version 6). `battery.py` prints the
+difference against the running voltage as **load sag**, which is the quantity the threshold exists
+to cover. It reads `not measured this boot` on USB, because charging skips the gate entirely;
+unplug and reset to get a figure.
+
+**Measured: 22 mV** — 3,853 mV at boot with nothing running, 3,831 mV with the radio, mic and card
+all up. That settles the original claim: 50–100 mV was roughly four times the real figure, and the
+50 mV margin at 3,470 mV covers the sag twice over. One caveat before treating 22 mV as the number:
+it was taken at 3,853 mV, in the middle of the discharge. Cell internal resistance rises as the cell
+empties, so the sag near the 3,420 mV knee — the only place the threshold actually matters — will be
+larger than this. That is the argument for leaving the margin at 50 mV rather than trimming it to
+the measurement, and for re-reading `load sag` on a nearly flat cell before anyone does trim it.
+
+Two deliberate escape hatches. **Charging always wins** — on USB the charger sustains the rail
+regardless of the cell, and refusing to boot would remove the only way to reach the device while it
+recovers. And **a gauge that returns nothing is not evidence of a flat battery**: if no sample
+succeeds the gate stands aside, because refusing to boot on no evidence would brick every board with
+a broken divider, which is a fault this project has already shipped once (trap 14).
+
+Verified on hardware by temporarily raising the threshold above the resting voltage: the board ran
+its boot LED sequence, blinked yellow three times, and went dark — no BLE advertisement (a scan saw
+72 other devices and none of them this one) and no CDC port, confirming it powered off before
+`transport_start()` and before USB init. A button press repeated it exactly.
+
+Generalising: **a periodic guard is only as good as its first decision, and a reset resets that
+clock.** Any protection built on a moving average has a cold-start window; if the event it guards
+against can happen inside that window, it needs a separate synchronous check on the boot path.
+
+### 20. The rolling average that never rolled
+
+Trap 19 fixed the two minutes `battery_guard()` could not cover. It turned out the other 40 hours
+were not covered either, because the guard could not fire **at any voltage**. The window was indexed
+with the counter that tracks how full it is:
+
+```c
+static uint8_t ticks, filled, strikes;
+window[filled % BATT_WINDOW] = mv;
+if (filled < BATT_WINDOW) { filled++; return; }   // stops here, permanently
+```
+
+`filled` stops incrementing the moment the window is full — that is its job — so `filled % 8` is 0
+from then on. Every later sample overwrites slot 0 and the other seven stay frozen at whatever the
+cell read in the first 80 seconds after boot. The mean is one live sample plus seven boot-time
+constants, so it cannot fall below `(7 × V_boot + V_now) / 8`. Boot at 4,100 mV and that floor is
+4,000 mV: above `BATT_WARN_MV`, far above `BATT_CRITICAL_MV`, **at a cell voltage of zero**.
+
+Simulating the exact indexing and strike logic against a cell ramped 4,100 → 3,300 mV:
+
+```
+  shipped (filled %):    lowest average 3965 mV   warn LED NEVER    shutdown NEVER FIRES
+  with write cursor:     lowest average 3395 mV   warn LED fires    shutdown fires
+```
+
+So the yellow low-battery blink and the graceful shutdown were both dead on arrival, and the
+protection written specifically to stop trap 18 from recurring would not have stopped it. The boot
+gate was unaffected — it runs its own local sampling loop and never touches this window — which is
+why the visible symptoms (three yellow blinks on a flat cell) still looked right.
+
+The fix is a write cursor that is separate from the fill counter:
+
+```c
+static uint8_t ticks, next, filled, strikes;
+window[next] = mv;
+next = (next + 1) % BATT_WINDOW;
+```
+
+Two things worth taking from this. **A fill counter and a write cursor are not the same variable
+even though they are equal for the first N iterations** — they diverge exactly when the ring starts
+being a ring, which is after every test short enough to be convenient. And a bug of this shape is
+invisible from outside: the guard sampled on schedule, logged plausible voltages, and computed an
+average that was arithmetically correct for the contents of the array. Only the contents were wrong.
+Nothing in a hardware smoke test distinguishes it from a working guard; a 30-line host simulation of
+the index arithmetic does so instantly. There is no firmware test lane in this tree to keep that
+simulation honest, which is the real gap this trap exposes.
 
 ## Measured Baselines
 
@@ -915,3 +1175,14 @@ them.
   `security_changed` member without SMP, so an unguarded assignment breaks the default image while
   the secure one still builds — build all three images (`omi_build.sh`, `omi_build_secure.sh`,
   `omi_build_unbond.sh`) before believing a Bluetooth change compiles.
+- **The first boot on a freshly formatted card does not size the ring.** Observed once, after the
+  Trap 18 reformat: `info.py` reported `0` segments, `cap 1` and a read offset of 4,294,967,295,
+  which is `count`, `seg_max_count` and `seg_bytes` all still at their compile-time initializers
+  plus a `get_offset()` that returned -1 because `info.txt` had not been created. That combination
+  can only mean `mount_sd_card()` returned early at the `segment_scan_locked()` check, since the
+  sizing function floors capacity at 2. Recording continued anyway — the write path only needs the
+  directory, which `fs_mkdir` had already created — so a whole session ran with a one-segment ring.
+  The very next boot was clean (`ring: 128 segments of 54517760 bytes`, `found 1 segments`), and
+  the failing boot was never captured on the console, so which call failed is still unknown.
+  Suspect `fs_opendir` immediately after `fs_mkdir` on a fresh volume. To catch it, have
+  `boot_capture.py` running *before* inserting a newly formatted card.

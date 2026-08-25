@@ -24,9 +24,12 @@ static struct fs_mount_t mount_point = {
     .fs_data = &fat_fs,
 };
 
-struct gpio_dt_spec sd_en_gpio_pin = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
-                                      .pin = 19,
-                                      .dt_flags = GPIO_INT_DISABLE};
+// dt_flags is 16 bits and carries only devicetree-level flags (active level, drive strength).
+// GPIO_INT_DISABLE lives above bit 16, so it truncated to 0 and the compiler warned about it on
+// every build. Active high is what gpio_pin_set_dt() below assumes, and 0 is active high, so the
+// behaviour was right by accident. The real configuration is passed to gpio_pin_configure_dt().
+// Same fix as button.c; see DEBUGGING.md on the dt_flags trap.
+struct gpio_dt_spec sd_en_gpio_pin = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)), .pin = 19, .dt_flags = 0};
 
 #define MAX_PATH_LENGTH 32
 static char current_full_path[MAX_PATH_LENGTH];

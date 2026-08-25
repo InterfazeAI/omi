@@ -276,7 +276,11 @@ class RingInfo:
     @property
     def total_bytes(self):
         """Approximate total across the ring; only the newest segment's length is exact."""
-        return (self.count - 1) * self.segment_bytes + self.newest_bytes
+        # count is 0 when the device reports ring state it never initialised -- a mount that
+        # failed after the audio directory was created still lets the write path append, so
+        # newest_bytes climbs while the segment list stays empty. Without the clamp that reads
+        # as one whole segment of negative audio.
+        return max(self.count - 1, 0) * self.segment_bytes + self.newest_bytes
 
     def __str__(self):
         return (f"{self.count} segments (seq {self.oldest_seq}..{self.newest_seq}), "
@@ -365,6 +369,20 @@ class BatteryDiag:
         # The same ADC pointed at the 3.3V rail. Without this every zero below is ambiguous
         # between a dead pin and a dead converter.
         self.vdd_mv = struct.unpack("<i", raw[22:26])[0]
+        # Layout 6 and later. What the boot gate measured before the radio, mic and card started;
+        # 0 when the gate did not run, which is every boot on USB since charging skips it.
+        self.boot_mv = struct.unpack("<H", raw[26:28])[0] if len(raw) >= 28 else 0
+
+    @property
+    def load_sag_mv(self):
+        """Boot reading minus the running one: how far the cell drops once everything is on.
+
+        This is the figure the boot gate's threshold has to clear, and the one that was assumed
+        rather than measured when the gate was written. None when the gate did not run.
+        """
+        if not self.boot_mv or self.battery_mv <= 0:
+            return None
+        return self.boot_mv - self.battery_mv
 
     @property
     def adc_trustworthy(self):

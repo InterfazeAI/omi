@@ -18,6 +18,15 @@ int button_init();
 void activate_button_work();
 void register_button_service();
 void turnoff_all();
+
+/**
+ * @brief Arm the button as a wake source and enter SYSTEMOFF. Does not return.
+ *
+ * The tail of turnoff_all(), split out for callers that must not touch the peripherals it shuts
+ * down -- notably the boot-time battery gate, which runs before the SD card is mounted and whose
+ * whole purpose is to avoid opening a file handle on a cell that cannot sustain the write.
+ */
+void enter_system_off(void);
 FSM_STATE_T get_current_button_state();
 
 void force_button_state(FSM_STATE_T state);

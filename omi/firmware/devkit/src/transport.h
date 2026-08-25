@@ -21,8 +21,9 @@
 #define OMI_PERM_WRITE BT_GATT_PERM_WRITE
 #endif
 
-typedef struct sensors {
-
+// Declared with `typedef` and no name, which names nothing and is what every translation unit
+// including this header was warning about. The sole user refers to it as `struct sensors`.
+struct sensors {
     struct sensor_value a_x;
     struct sensor_value a_y;
     struct sensor_value a_z;
@@ -49,7 +50,6 @@ int transport_start();
 void transport_finish_unbond(void);
 int broadcast_audio_packets(uint8_t *buffer, size_t size);
 struct bt_conn *get_current_connection();
-int bt_on();
 int bt_off();
 
 void accel_off();

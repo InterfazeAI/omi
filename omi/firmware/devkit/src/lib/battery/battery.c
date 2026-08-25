@@ -145,25 +145,38 @@ typedef struct {
     uint8_t percentage;
 } BatteryState;
 
-#define BATTERY_STATES_COUNT 16
-// 1S 250mAh LiPo battery discharge profile
+// Measured on this board, not a datasheet curve.
+//
+// This was a generic "1S 250mAh LiPo discharge profile" ending {3255,2}, {3164,1}, {3000,0}. Those
+// three rows describe voltages the hardware cannot reach: VDD held 3,293-3,309 mV across an entire
+// discharge and never sagged, so what ends a run is the 3.3 V rail plus regulator dropout, around
+// 3,330-3,390 mV. Reaching the old 1% point would have taken 15 h beyond the last sample of a cell
+// that was flat within 6.5 h. In practice the gauge sank to about 10% and the board then died,
+// never counting through 5, 2, 1. It also read low throughout the middle -- 50% at 3,756 mV where
+// roughly three quarters of the runtime remained.
+//
+// These points come from 1,333 samples across one full discharge (see DEBUGGING.md trap 14),
+// converted to percent-of-runtime-remaining, which is the only honest meaning available: the load
+// is constant, so charge burned is proportional to elapsed time. 0% is the observed cutoff rather
+// than a nominal empty, so the reading now reaches zero at about the moment the board stops.
+//
+// Caveats worth knowing before trusting the last digit. One cell, one discharge, one temperature.
+// The bottom is bounded by a 6.5 h window in which the cell died unmonitored, and the top is
+// extrapolated above 4,020 mV where logging began. Nothing safety-related reads this table --
+// battery_guard() and battery_boot_gate() both work in millivolts -- so an error here costs
+// display accuracy and nothing else.
+#define BATTERY_STATES_COUNT 10
 BatteryState battery_states[BATTERY_STATES_COUNT] = {
-    {4074, 100},
-    {4029, 95},
-    {3983, 90},
-    {3938, 85},
-    {3893, 80},
-    {3847, 70},
-    {3802, 60},
-    {3756, 50},
-    {3665, 40},
-    {3619, 30},
-    {3528, 20},
-    {3437, 10},
-    {3346, 5},
-    {3255, 2},
-    {3164, 1},
-    {3000, 0} // Below safe level
+    {4150, 100}, // full charge as measured off the charger
+    {4050, 92},
+    {3950, 84},
+    {3850, 73},
+    {3750, 64},
+    {3650, 48},
+    {3550, 24}, // the plateau ends here and the knee begins
+    {3500, 15}, // BATT_WARN_MV: yellow LED starts blinking
+    {3450, 6},
+    {3400, 0} // regulator dropout: the board stops within a few hundred mV/h of here
 };
 
 static uint8_t is_initialized = false;
@@ -271,6 +284,15 @@ int battery_get_millivolt(uint16_t *battery_millivolt)
     return 0;
 }
 
+// Survives from the boot gate into the running system, which is the whole point: the pair of
+// readings only means something if they come from the same charge.
+static uint16_t boot_mv = 0;
+
+void battery_note_boot_reading(uint16_t mv)
+{
+    boot_mv = mv;
+}
+
 int battery_get_diagnostics(struct battery_diag *diag)
 {
     struct battery_diag off = {0};
@@ -281,6 +303,7 @@ int battery_get_diagnostics(struct battery_diag *diag)
     diag->setup_err = setup_err;
     diag->gpio_err = gpio_err;
     diag->charging = (uint8_t) (battery_is_charging() == 1);
+    diag->boot_mv = boot_mv;
     // Read both registers back from the hardware rather than trusting that the write happened.
     // OUT alone is not enough: it reads 0 on a pin that was never made an output, which looks
     // identical to a pin correctly driven low while the divider is actually switched off.

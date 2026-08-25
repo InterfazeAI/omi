@@ -59,12 +59,14 @@ static const char *phy2str(uint8_t phy)
     }
 }
 
+#ifdef CONFIG_OMI_ENABLE_SPEAKER
 static ssize_t audio_data_write_handler(struct bt_conn *conn,
                                         const struct bt_gatt_attr *attr,
                                         const void *buf,
                                         uint16_t len,
                                         uint16_t offset,
                                         uint8_t flags);
+#endif
 
 static struct bt_conn_cb _callback_references;
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
@@ -102,8 +104,10 @@ static struct bt_uuid_128 audio_characteristic_data_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10001, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 static struct bt_uuid_128 audio_characteristic_format_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10002, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+#ifdef CONFIG_OMI_ENABLE_SPEAKER
 static struct bt_uuid_128 audio_characteristic_speaker_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10003, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+#endif
 
 // Every permission below is the _ENCRYPT variant: live microphone audio and the recording it
 // belongs to must not be readable by an unpaired device. The CCC reads stay unencrypted because
@@ -394,7 +398,7 @@ static struct bt_uuid_128 diagnostics_service_uuid =
 static struct bt_uuid_128 battery_diag_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10051, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 
-#define BATTERY_DIAG_BYTES 26
+#define BATTERY_DIAG_BYTES 28
 
 static ssize_t battery_diag_read_handler(struct bt_conn *conn,
                                          const struct bt_gatt_attr *attr,
@@ -407,7 +411,7 @@ static ssize_t battery_diag_read_handler(struct bt_conn *conn,
 
     int err = battery_get_diagnostics(&diag);
 
-    out[0] = 5; // layout version
+    out[0] = 6; // layout version
     out[1] = diag.read_enable;
     sys_put_le16((uint16_t) diag.raw_counts, &out[2]);
     sys_put_le32((uint32_t) diag.adc_mv, &out[4]);
@@ -422,6 +426,10 @@ static ssize_t battery_diag_read_handler(struct bt_conn *conn,
     out[20] = diag.enable_is_output;
     out[21] = diag.charging;
     sys_put_le32((uint32_t) diag.vdd_mv, &out[22]);
+    // What the boot gate measured before the radio, mic and card came up. Read against battery_mv
+    // above, on the same charge, this is the load sag the gate's threshold is supposed to allow
+    // for -- currently the one number in that calculation that was assumed rather than measured.
+    sys_put_le16(diag.boot_mv, &out[26]);
 
     return bt_gatt_attr_read(conn, attr, buf, len, offset, out, sizeof(out));
 }
@@ -526,9 +534,10 @@ void broadcast_accel(struct k_work *work_item)
     k_work_reschedule(&accel_work, K_MSEC(ACCEL_REFRESH_INTERVAL));
 }
 
-struct gpio_dt_spec accel_gpio_pin = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
-                                      .pin = 8,
-                                      .dt_flags = GPIO_INT_DISABLE};
+// GPIO_INT_DISABLE is above bit 16 and dt_flags is 16 bits wide, so this silently truncated to 0
+// and warned on every build. 0 is active high, which is what gpio_pin_set_dt() below relies on, so
+// nothing changes here beyond saying it outright. See the identical note in sdcard.c and button.c.
+struct gpio_dt_spec accel_gpio_pin = {.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 8, .dt_flags = 0};
 
 // use d4,d5
 static void accel_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
@@ -635,6 +644,7 @@ static ssize_t audio_codec_read_characteristic(struct bt_conn *conn,
     return bt_gatt_attr_read(conn, attr, buf, len, offset, value, sizeof(value));
 }
 
+#ifdef CONFIG_OMI_ENABLE_SPEAKER
 static ssize_t audio_data_write_handler(struct bt_conn *conn,
                                         const struct bt_gatt_attr *attr,
                                         const void *buf,
@@ -643,12 +653,11 @@ static ssize_t audio_data_write_handler(struct bt_conn *conn,
                                         uint8_t flags)
 {
     uint16_t amount = 400;
-    int16_t *int16_buf = (int16_t *) buf;
-    uint8_t *data = (uint8_t *) buf;
     bt_gatt_notify(conn, attr, &amount, sizeof(amount));
-    amount = speak(len, buf);
+    speak(len, buf);
     return len;
 }
+#endif
 
 //
 // DFU Service Handlers
@@ -958,7 +967,6 @@ static bool push_to_gatt(struct bt_conn *conn)
 #define OPUS_PADDED_LENGTH 80
 #define MAX_WRITE_SIZE 440
 static uint8_t storage_temp_data[MAX_WRITE_SIZE];
-static uint32_t offset = 0;
 static uint16_t buffer_offset = 0;
 // Packs the frame currently held in tx_buffer into the 440-byte block and flushes the block to
 // the card when full. Like push_to_gatt(), the caller owns the dequeue.
@@ -1096,16 +1104,11 @@ int bt_off()
 
     return 0;
 }
-int bt_on()
-{
-    int err = bt_enable(NULL);
-    bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
-    bt_gatt_service_register(&storage_service);
-    sd_on();
-    mic_on();
-
-    return 0;
-}
+// bt_on() used to live here as the counterpart to bt_off(). Nothing called it, and nothing could
+// usefully have called it: bt_off()'s only caller is turnoff_all(), which continues into SYSTEMOFF,
+// and waking from SYSTEMOFF is a full reset that runs transport_start() from scratch. It also
+// ignored the result of every call it made, including bt_enable(), so a failed stack init would
+// have gone on to advertise and register services anyway and still returned 0.
 
 // periodic advertising
 int transport_start()

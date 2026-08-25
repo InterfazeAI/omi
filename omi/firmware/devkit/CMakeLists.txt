@@ -13,7 +13,6 @@ target_sources(app PRIVATE
     src/codec.c
     src/lib/battery/battery.c
     src/button.c
-    src/speaker.c
     src/rtc.c
     src/sdcard.c
     src/storage.c
@@ -21,6 +20,14 @@ target_sources(app PRIVATE
     src/wdog_facade.c
 	# src/nfc.c future release
 )
+
+# Both peripherals live in speaker.c, so this cannot key on CONFIG_OMI_ENABLE_SPEAKER alone:
+# sd-on-no-button-speaker.conf and no-sd-button-speaker.conf disable the speaker while leaving
+# CONFIG_OMI_ENABLE_HAPTIC=y from the base config, and gating on the speaker symbol would drop
+# init_haptic_pin() and play_haptic_milli() out from under them.
+if(CONFIG_OMI_ENABLE_SPEAKER OR CONFIG_OMI_ENABLE_HAPTIC)
+    target_sources(app PRIVATE src/speaker.c)
+endif()
 
 target_sources_ifdef(CONFIG_OMI_CODEC_OPUS app PRIVATE
     src/lib/opus-1.2.1/A2NLSF.c

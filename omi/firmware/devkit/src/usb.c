@@ -5,15 +5,17 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/usb/usb_device.h>
 
-#include "speaker.h"
-#include "transport.h"
 #include "usb.h"
 LOG_MODULE_REGISTER(usb, CONFIG_LOG_DEFAULT_LEVEL);
 
 // add all device drivers here?
 bool usb_charge = false;
 
-usb_dc_status_callback udc_status_cb(enum usb_dc_status_code status, const uint8_t *param)
+// `usb_dc_status_callback` is the function-*pointer* typedef Zephyr expects to be handed, not a
+// return type. Naming it here declared a function returning a function pointer whose body then
+// fell off the end, which is undefined behaviour, and made both call sites below pass an
+// incompatible pointer. The callback itself returns nothing.
+static void udc_status_cb(enum usb_dc_status_code status, const uint8_t *param)
 {
     switch (status) {
     case USB_DC_CONNECTED:
@@ -25,8 +27,6 @@ usb_dc_status_callback udc_status_cb(enum usb_dc_status_code status, const uint8
     default:
         usb_charge = true;
     }
-
-    return;
 }
 
 int init_usb()

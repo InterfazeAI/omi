@@ -71,6 +71,27 @@ bool is_connected = false;
 bool is_charging = false;
 extern bool is_off;
 extern bool usb_charge;
+
+// First init failure of this boot, or NULL. Init must never return out of main(): the watchdog is
+// started early and only main's final loop feeds it, so `return err` from any init step is a
+// silent 30-second reset loop -- and a reset loop cannot be asked what is wrong. A corrupted SD
+// card bricked this board that way when it should only have disabled recording.
+static const char *boot_fault_what;
+static int boot_fault_err;
+
+static void note_boot_fault(const char *what, int err)
+{
+    LOG_ERR("boot fault: %s (err %d) -- continuing in degraded mode", what, err);
+    if (!boot_fault_what) {
+        boot_fault_what = what;
+        boot_fault_err = err;
+    }
+}
+
+bool boot_faulted(void)
+{
+    return boot_fault_what != NULL;
+}
 static void boot_led_sequence(void)
 {
     // Red blink
@@ -99,12 +120,205 @@ static void boot_led_sequence(void)
     set_led_blue(false);
 }
 
+// Low-battery guard.
+//
+// Measured on this hardware over 1,333 samples: a full cell runs about 40 h recording
+// continuously, falling 22.8 mV/h at the top, 9.1 mV/h across the long 3.8-3.5 V plateau, and
+// 18.9 mV/h and steepening at the knee. So a few hundred millivolts of reserve costs hours -- but
+// spending them is still the right trade, because running the cell to collapse does not merely
+// stop the recording. When it happened during that drain test the card was mid-write, and the SD
+// controller dropped an entire 4 MiB erase block: the boot sector and both FAT tables went with
+// it, the filesystem became unmountable and the board then watchdog-looped on every boot. Shutting
+// down under our own control, while the regulator is still in spec and the file handle can be
+// closed, avoids all of that.
+//
+// The threshold was 3,350 mV, chosen before the discharge was fully characterised. That turned out
+// to sit *inside* the estimated cutoff band rather than above it: the board was still running at
+// 3,455 mV when logging stopped and was flat within 6.5 h, which at the measured knee rate puts
+// collapse at 3,330-3,390 mV. VDD agrees -- it held 3,293-3,309 mV across the whole discharge and
+// never sagged, so the floor is the 3.3 V rail plus dropout, not the chemistry. 3,420 mV clears
+// that band with margin and costs roughly 3-4 h of the 40.
+#define BATT_WARN_MV 3500
+#define BATT_CRITICAL_MV 3420
+#define BATT_SAMPLE_TICKS 20    // loop runs every 500 ms, so sample every 10 s
+#define BATT_WINDOW 8           // single reads jitter +/-40 mV; decide on an average, never one
+#define BATT_CRITICAL_STRIKES 3 // and only after the average stays low, never on one excursion
+
+// Boot gate.
+//
+// battery_guard() protects a running board, but it cannot protect the first two minutes of one.
+// After a low-battery shutdown the cell sits just under BATT_CRITICAL_MV, and SYSTEMOFF drops the
+// load to roughly a microamp -- at which point an unloaded Li-ion cell recovers 50-100 mV. So the
+// next button press sees a healthy-looking voltage, boots, mounts the card, opens a segment for
+// append, and sags straight back under load. The guard cannot intervene during any of that: waking
+// from SYSTEMOFF is a reset, so its averaging window starts empty and needs 80 s to fill before it
+// may decide anything, then 30 s more to strike out. Each press therefore buys about two minutes
+// of recording onto a cell already known to be at the edge of brownout, with no warning LED either,
+// because battery_low is likewise unset until the window fills. That is precisely the mid-write
+// power loss that destroyed a filesystem once already.
+//
+// So the gate runs before mount_sd_card() and declines to bring the card up at all.
+//
+// On the threshold, and an earlier claim here that was wrong. This originally read 3,450 mV and
+// justified itself as sitting above BATT_CRITICAL_MV "by about the recovery it compensates for",
+// quoting 50-100 mV. Those two statements contradict each other -- the gap is only 30 mV -- and the
+// quoted figure was assumed, never measured. Reasoning from the actual load makes it worse: the
+// board averages about 6 mA (40 h on a 250 mAh cell), so the IR component of the sag is single-
+// digit millivolts, and what recovery there is comes from slower diffusion relaxation, tens of
+// millivolts at most. A 30 mV gap does not reliably cover even that.
+//
+// 3,470 mV gives 50 mV of margin over the runtime threshold, which covers plausible relaxation
+// without refusing cells that still hold hours. It remains an estimate, so the gate now records
+// what it measured via battery_note_boot_reading(); read it against the running voltage over BLE
+// (battery.py) on one charge and the sag stops being a guess.
+#define BATT_BOOT_MIN_MV 3470
+#define BATT_BOOT_SAMPLES 8
+
+static bool battery_low = false;
+
+static void battery_boot_gate(void)
+{
+    // Charging outranks the check. On USB the charger sustains the rail whatever the cell is doing,
+    // and refusing to boot would leave no way to talk to the device while it recovers -- which is
+    // the one moment you most want it reachable.
+    if (battery_is_charging() == 1) {
+        return;
+    }
+
+    // The runtime guard spaces samples 10 s apart to average over load variation. Nothing is loaded
+    // yet, so consecutive reads suffice and the whole check costs milliseconds rather than 80 s --
+    // which matters, since every millisecond of it is drawn from a suspect cell.
+    uint32_t sum = 0;
+    uint8_t taken = 0;
+    for (uint8_t i = 0; i < BATT_BOOT_SAMPLES; i++) {
+        uint16_t mv = 0;
+        if (battery_get_millivolt(&mv) == 0 && mv != 0) {
+            sum += mv;
+            taken++;
+        }
+    }
+
+    // Same reasoning as the runtime guard: a gauge that is not reading is not evidence of a flat
+    // battery. Refusing to boot on no evidence would brick every board with a broken divider, which
+    // is a fault this project has already shipped once.
+    if (taken == 0) {
+        LOG_WRN("Battery boot gate: no usable reading, continuing");
+        return;
+    }
+
+    uint16_t avg = (uint16_t) (sum / taken);
+
+    // Recorded either way. The reading that matters most is the one from a boot that was allowed
+    // to proceed, because that is the one with a running counterpart to compare against.
+    battery_note_boot_reading(avg);
+
+    if (avg >= BATT_BOOT_MIN_MV) {
+        LOG_INF("Battery %u mV at rest, continuing boot", avg);
+        return;
+    }
+
+    LOG_ERR("Battery too flat to boot (%u mV at rest): powering off without mounting the card", avg);
+
+    // Three yellow blinks, then dark. Yellow because red means recording and this board is not
+    // going to record; three deliberate blinks because the alternative -- going straight to
+    // SYSTEMOFF -- is indistinguishable from a board that is simply broken.
+    for (int i = 0; i < 3; i++) {
+        set_led_red(true);
+        set_led_green(true);
+        k_msleep(120);
+        set_led_red(false);
+        set_led_green(false);
+        k_msleep(200);
+    }
+
+    enter_system_off();
+}
+
+static void battery_guard(void)
+{
+    static uint16_t window[BATT_WINDOW];
+    // `next` is deliberately separate from `filled`. Indexing with `filled % BATT_WINDOW` looks
+    // equivalent and is not: `filled` stops incrementing once the window is full, so every later
+    // sample lands in slot 0 and the other seven stay pinned to the first 80 seconds after boot.
+    // That does not merely bias the mean, it caps it -- with a full cell at boot the average cannot
+    // reach BATT_CRITICAL_MV even at 0 V, so the shutdown and the warning LED never fire at all.
+    static uint8_t ticks, next, filled, strikes;
+
+    if (++ticks < BATT_SAMPLE_TICKS) {
+        return;
+    }
+    ticks = 0;
+
+    uint16_t mv = 0;
+    if (battery_get_millivolt(&mv) != 0 || mv == 0) {
+        return; // a gauge that is not reading is not evidence of a flat battery
+    }
+
+    window[next] = mv;
+    next = (uint8_t) ((next + 1) % BATT_WINDOW);
+    if (filled < BATT_WINDOW) {
+        filled++;
+        return; // no decision until the average means something
+    }
+
+    uint32_t sum = 0;
+    for (int i = 0; i < BATT_WINDOW; i++) {
+        sum += window[i];
+    }
+    uint16_t avg = (uint16_t) (sum / BATT_WINDOW);
+
+    if (battery_is_charging() == 1) {
+        strikes = 0;
+        battery_low = false;
+        return;
+    }
+
+    battery_low = (avg < BATT_WARN_MV);
+
+    if (avg >= BATT_CRITICAL_MV) {
+        strikes = 0;
+        return;
+    }
+
+    if (++strikes >= BATT_CRITICAL_STRIKES) {
+        LOG_ERR("battery critical (%u mV): closing files and powering off", avg);
+        turnoff_all(); // flushes the write batch and closes the segment before SYSTEMOFF
+    }
+}
+
 void set_led_state()
 {
+    // Three red blinks confirming the erase-and-unbond finished, set by the storage thread at the
+    // point the work actually completed. Outranks the warning below because the two overlap: the
+    // yellow warning stays lit while the button is still held, and going straight to the
+    // confirmation is what tells you it is done and you can let go.
+    if (storage_unbond_done_blinks) {
+        storage_unbond_done_blinks--;
+        set_led_red((storage_unbond_done_blinks % 2) == 1);
+        set_led_green(false);
+        set_led_blue(false);
+        return;
+    }
+
     // Yellow while the button is warning about a reset. Checked before anything else because this
     // refresh runs every 500 ms: without the early return it would clear the warning colour almost
     // as soon as button.c set it, leaving no signal at all before the card is erased.
     if (button_reset_warning) {
+        return;
+    }
+
+    // Low battery outranks connection state: a blink you can miss is better than a board that dies
+    // without warning, and the states below would otherwise hold the LED steady.
+    //
+    // Yellow, not red. Steady red already means "recording, no connection", and asking anyone to
+    // tell that apart from a red blink is asking too much of one LED. Red stays recording; yellow
+    // means the battery needs attention, at boot and at runtime alike.
+    if (battery_low) {
+        static bool phase;
+        phase = !phase;
+        set_led_red(phase);
+        set_led_green(phase);
+        set_led_blue(false);
         return;
     }
 
@@ -169,12 +383,13 @@ int main(void)
 
     err = led_start();
     if (err) {
-        LOG_ERR("Failed to initialize LEDs (err %d)", err);
-        return err;
+        // Alone among these, this one runs before watchdog_init, so failing here used to leave a
+        // dead board rather than a resetting one. Either way there is no reason three status LEDs
+        // should decide whether the microphone runs.
+        note_boot_fault("led init", err);
+    } else {
+        boot_led_sequence();
     }
-
-    // Run the boot LED sequence
-    boot_led_sequence();
 
     // Initialize watchdog early to catch any freezes during boot
     err = watchdog_init();
@@ -186,42 +401,46 @@ int main(void)
 #ifdef CONFIG_OMI_ENABLE_BATTERY
     err = battery_init();
     if (err) {
-        LOG_ERR("Battery init failed (err %d)", err);
-        return err;
+        note_boot_fault("battery init", err);
+    } else {
+        LOG_INF("Battery initialized");
     }
-
-    LOG_INF("Battery initialized");
 #endif
 
     // Enable button
 #ifdef CONFIG_OMI_ENABLE_BUTTON
     err = button_init();
     if (err) {
-        LOG_ERR("Failed to initialize Button (err %d)", err);
-        return err;
+        note_boot_fault("button init", err);
+    } else {
+        LOG_INF("Button initialized");
+        activate_button_work();
     }
-    LOG_INF("Button initialized");
-    activate_button_work();
 #endif
+
+    // Refuse to go further on a cell that cannot sustain a write. Deliberately placed here: after
+    // button_init(), so enter_system_off() has a wake source to arm, and before anything opens the
+    // SD card, which is the resource being protected.
+    battery_boot_gate();
 
     // Enable accelerometer
 #ifdef CONFIG_OMI_ENABLE_ACCELEROMETER
     err = accel_start();
     if (err) {
-        LOG_ERR("Accelerometer failed to activated (err %d)", err);
-        return err;
+        note_boot_fault("accelerometer start", err);
+    } else {
+        LOG_INF("Accelerometer initialized");
     }
-    LOG_INF("Accelerometer initialized");
 #endif
 
     // Enable speaker
 #ifdef CONFIG_OMI_ENABLE_SPEAKER
     err = speaker_init();
     if (err) {
-        LOG_ERR("Speaker failed to start");
-        return err;
+        note_boot_fault("speaker init", err);
+    } else {
+        LOG_INF("Speaker initialized");
     }
-    LOG_INF("Speaker initialized");
 #endif
 
     // Enable sdcard
@@ -231,22 +450,25 @@ int main(void)
 
     err = mount_sd_card();
     if (err) {
-        LOG_ERR("Failed to mount SD card (err %d)", err);
-        return err;
-    }
-    k_msleep(500);
+        // Everything below needs the card, but the radio does not: without storage the device
+        // still streams live audio and still answers diagnostics, which is what lets you find out
+        // why the card is missing. Bricking here is strictly worse than recording nothing.
+        note_boot_fault("sdcard mount", err);
+    } else {
+        k_msleep(500);
 
-    // Needs the card mounted: the boot counter is persisted there for want of an RTC or NVS.
-    rtc_init();
-    // Anchor the offset this session starts at, even though the clock is not yet set.
-    storage_index_mark(true);
+        // Needs the card mounted: the boot counter is persisted there for want of an RTC or NVS.
+        rtc_init();
+        // Anchor the offset this session starts at, even though the clock is not yet set.
+        storage_index_mark(true);
 
-    LOG_PRINTK("\n");
-    LOG_INF("Initializing storage...\n");
+        LOG_PRINTK("\n");
+        LOG_INF("Initializing storage...\n");
 
-    err = storage_init();
-    if (err) {
-        LOG_ERR("Failed to initialize storage (err %d)", err);
+        err = storage_init();
+        if (err) {
+            note_boot_fault("storage init", err);
+        }
     }
 #endif
 
@@ -257,10 +479,10 @@ int main(void)
 
     err = init_haptic_pin();
     if (err) {
-        LOG_ERR("Failed to initialize haptic pin (err %d)", err);
-        return err;
+        note_boot_fault("haptic init", err);
+    } else {
+        LOG_INF("Haptic pin initialized");
     }
-    LOG_INF("Haptic pin initialized");
 #endif
 
     // Enable usb
@@ -270,8 +492,7 @@ int main(void)
 
     err = init_usb();
     if (err) {
-        LOG_ERR("Failed to initialize power supply (err %d)", err);
-        return err;
+        note_boot_fault("usb init", err);
     }
 #endif
 
@@ -286,8 +507,6 @@ int main(void)
     int transportErr;
     transportErr = transport_start();
     if (transportErr) {
-        LOG_ERR("Failed to start transport (err %d)", transportErr);
-        // TODO: Detect the current core is app core or net core
         // Blink green LED to indicate error
         for (int i = 0; i < 5; i++) {
             set_led_green(!gpio_pin_get_dt(&led_green));
@@ -295,7 +514,7 @@ int main(void)
         }
         set_led_green(false);
 
-        return transportErr;
+        note_boot_fault("transport start", transportErr);
     }
 
 #ifdef CONFIG_OMI_ENABLE_SPEAKER
@@ -311,14 +530,13 @@ int main(void)
     set_codec_callback(codec_handler);
     err = codec_start();
     if (err) {
-        LOG_ERR("Failed to start codec: %d", err);
         // Blink blue LED to indicate error
         for (int i = 0; i < 5; i++) {
             set_led_blue(!gpio_pin_get_dt(&led_blue));
             k_msleep(200);
         }
         set_led_blue(false);
-        return err;
+        note_boot_fault("codec start", err);
     }
 
 #ifdef CONFIG_OMI_ENABLE_HAPTIC
@@ -336,7 +554,6 @@ int main(void)
     set_mic_callback(mic_handler);
     err = mic_start();
     if (err) {
-        LOG_ERR("Failed to start microphone: %d", err);
         // Blink red and green LEDs to indicate error
         for (int i = 0; i < 5; i++) {
             set_led_red(!gpio_pin_get_dt(&led_red));
@@ -345,15 +562,18 @@ int main(void)
         }
         set_led_red(false);
         set_led_green(false);
-        return err;
+        note_boot_fault("mic start", err);
     }
 
     set_led_red(false);
     set_led_green(false);
 
-    // Indicate successful initialization
     LOG_PRINTK("\n");
-    LOG_INF("Device initialized successfully\n");
+    if (boot_fault_what) {
+        LOG_ERR("Device initialized DEGRADED: %s failed (err %d)", boot_fault_what, boot_fault_err);
+    } else {
+        LOG_INF("Device initialized successfully\n");
+    }
 
     set_led_blue(true);
     k_msleep(1000);
@@ -366,6 +586,7 @@ int main(void)
     while (1) {
         watchdog_feed();
 
+        battery_guard();
         set_led_state();
         k_msleep(500);
     }

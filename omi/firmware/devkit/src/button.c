@@ -371,18 +371,15 @@ FSM_STATE_T get_current_button_state()
     return current_button_state;
 }
 
-void turnoff_all()
+void enter_system_off(void)
 {
-
-    mic_off();
-    sd_off();
-    speaker_off();
-    accel_off();
-    play_haptic_milli(50);
-    k_msleep(100);
     set_led_blue(false);
     set_led_red(false);
     set_led_green(false);
+
+    // Arm the button as the only wake source. Both calls tolerate a button that was never brought
+    // up -- removing an unregistered callback is a no-op and configuring an unconfigured pin just
+    // returns an error -- which is what lets the boot gate share this path.
     gpio_remove_callback(d5_pin_input.port, &button_cb_data);
     gpio_pin_interrupt_configure_dt(&d5_pin_input, GPIO_INT_LEVEL_INACTIVE);
 
@@ -392,9 +389,27 @@ void turnoff_all()
         LOG_ERR("Failed to deinitialize watchdog (%d)", rc);
     }
 
-    // maybe save something here to indicate success. next time the button is pressed we should know about it
     NRF_USBD->INTENCLR = 0xFFFFFFFF;
     NRF_POWER->SYSTEMOFF = 1;
+}
+
+void turnoff_all()
+{
+
+    mic_off();
+    sd_off();
+#ifdef CONFIG_OMI_ENABLE_SPEAKER
+    speaker_off();
+#endif
+    accel_off();
+#ifdef CONFIG_OMI_ENABLE_HAPTIC
+    // Costs 50 ms on the way to SYSTEMOFF, and on a board with no motor fitted it also drives an
+    // enable pin that goes nowhere.
+    play_haptic_milli(50);
+#endif
+    k_msleep(100);
+
+    enter_system_off();
 }
 
 void force_button_state(FSM_STATE_T state)
