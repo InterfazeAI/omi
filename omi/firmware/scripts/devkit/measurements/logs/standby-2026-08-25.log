@@ -1,0 +1,13 @@
+# SYSTEMOFF standby drain baseline
+# Board shut down by triple-tap immediately after this reading.
+timestamp_before_shutdown  2026-08-25 00:50:53 PDT
+epoch                      1787644253
+running_mv_median          3828
+running_mv_mean            3824.8
+running_mv_spread          3792 .. 3846  (54 mV)
+reported_pct               72
+boot_mv_this_session       3822  (rested, at the boot that is about to end)
+samples                    12
+
+# On wake, record boot_mv from the new session: it is a rested reading taken the same
+# way, which is the only like-for-like comparison available.

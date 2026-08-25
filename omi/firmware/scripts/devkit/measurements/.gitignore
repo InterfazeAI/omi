@@ -1,0 +1,9 @@
+# Derived artifacts: JSON, plots and compiled simulations, all reproducible from logs/ beside them.
+out/
+
+# The repo root ignores *.log to keep build and run output out of history. The files in logs/ are
+# measurement data rather than build noise -- they are the evidence behind the battery numbers in
+# devkit/DEBUGGING.md and cannot be regenerated without another 40-hour discharge -- so re-include
+# them. Without this they are silently skipped by `git add` and the analysis scripts here have
+# nothing to read on a fresh clone.
+!logs/*.log

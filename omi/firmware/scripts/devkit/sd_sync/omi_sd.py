@@ -372,17 +372,25 @@ class BatteryDiag:
         # Layout 6 and later. What the boot gate measured before the radio, mic and card started;
         # 0 when the gate did not run, which is every boot on USB since charging skips it.
         self.boot_mv = struct.unpack("<H", raw[26:28])[0] if len(raw) >= 28 else 0
+        # Layout 7 and later. The guard's rolling mean, which the reported percentage is built on,
+        # and the load sag frozen at the first settled mean rather than recomputed.
+        if len(raw) >= 32:
+            self.smoothed_mv = struct.unpack("<H", raw[28:30])[0]
+            sag = struct.unpack("<h", raw[30:32])[0]
+            self.load_sag_mv = None if sag == -32768 else sag
+        else:
+            self.smoothed_mv = 0
+            self.load_sag_mv = None
 
     @property
-    def load_sag_mv(self):
-        """Boot reading minus the running one: how far the cell drops once everything is on.
+    def jitter_mv(self):
+        """Fresh single read minus the smoothed mean: the jitter the gauge used to publish.
 
-        This is the figure the boot gate's threshold has to clear, and the one that was assumed
-        rather than measured when the gate was written. None when the gate did not run.
+        None until the guard's window fills, about 80 s into a boot.
         """
-        if not self.boot_mv or self.battery_mv <= 0:
+        if not self.smoothed_mv or self.battery_mv <= 0:
             return None
-        return self.boot_mv - self.battery_mv
+        return self.battery_mv - self.smoothed_mv
 
     @property
     def adc_trustworthy(self):

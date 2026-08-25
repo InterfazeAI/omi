@@ -107,6 +107,8 @@ struct battery_diag {
     int32_t vdd_mv;           /**< same ADC pointed at the 3.3V supply: the control, see below */
     uint8_t charging;         /**< P0.17 (~CHG) from the BQ25100: 1 = charging */
     uint16_t boot_mv;         /**< what the boot gate measured before any load came up; 0 if it did not run */
+    uint16_t smoothed_mv;     /**< the guard's rolling mean -- what the reported percentage is built on */
+    int16_t load_sag_mv;      /**< boot_mv minus the first settled mean, captured once; INT16_MIN if unknown */
     int8_t init_err;          /**< result of the last battery_init() */
     int8_t setup_err;         /**< result of adc_channel_setup() during init */
     int8_t gpio_err;          /**< result of configuring the three control pins */
@@ -131,5 +133,40 @@ int battery_get_diagnostics(struct battery_diag *diag);
  * on battery, where there is no USB console to print to.
  */
 void battery_note_boot_reading(uint16_t mv);
+
+/**
+ * @brief Hand the battery driver the guard's rolling mean, once per guard decision.
+ *
+ * Exists so there is exactly one smoothed voltage in the system. A single ADC read carries about
+ * ±40 mV of jitter, and the gauge curve reaches 0.24 %/mV around 3,600 mV, so converting one read
+ * straight to a percentage swings the reported level by up to ten points between samples taken
+ * seconds apart -- which is what it used to do, 15 s apart, forever.
+ *
+ * Feeding the gauge from the guard's mean rather than filtering separately also keeps the yellow
+ * low-battery LED and the reported percentage in agreement. They were previously derived from
+ * different samples, so the LED could warn while the percentage looked healthy, or the reverse.
+ *
+ * The first call also freezes the load sag (see battery_diag::load_sag_mv): by the time the guard
+ * has a full window everything is running, which is the moment that difference means something.
+ */
+void battery_note_smoothed_reading(uint16_t mv);
+
+/**
+ * @brief The percentage to report to a host: median-filtered, and monotone in the cell's direction.
+ *
+ * Prefer this over battery_get_percentage() for anything user-visible. That one converts whatever
+ * voltage it is handed, so on a fresh single read it published ±40 mV of ADC jitter through a curve
+ * reaching 0.24 %/mV -- a stationary cell reading 38, 42, then 38 again.
+ *
+ * Two stages fix it: a median over the guard's recent means, then a monotone hold that only lets
+ * the figure fall while discharging and rise while charging. Smoothing alone made reversals rarer
+ * rather than absent; the monotone hold is what removes them. Measured in
+ * measurements/gauge_smoothing_sim.c: 2,457 reversals as shipped, 0 with both stages, with the
+ * worst deviation from truth holding at 3 points.
+ *
+ * Falls back to a fresh single read before the guard's window has filled, so the first ~80 s after
+ * boot still reports something rather than nothing.
+ */
+int battery_get_reported_percentage(uint8_t *battery_percentage);
 
 #endif

@@ -288,9 +288,109 @@ int battery_get_millivolt(uint16_t *battery_millivolt)
 // readings only means something if they come from the same charge.
 static uint16_t boot_mv = 0;
 
+// Second smoothing stage, over the guard's means. The guard's own window cannot simply be made
+// longer: its length also sets how fast the low-battery shutdown can react, and 8 samples at 10 s
+// is already 80 s of exposure. So the extra smoothing the gauge needs lives here instead.
+//
+// Median, not mean, because a median discards outliers outright where a mean folds them in. Both
+// numbers below were chosen by measuring, not by taste -- see measurements/gauge_smoothing_sim.c,
+// which replays this exact path against a draining cell with the +-40 mV jitter measured on the
+// hardware and counts direction reversals in the published series:
+//
+//   single read (as shipped)   2457 reversals, worst error 10 points
+//   guard mean alone           1174
+//   median of 16 + monotone       0            worst error  3
+//   median of 32 + monotone       0            worst error  3, final value exact
+//
+// 32 costs 64 bytes and lands the final reading on the truth, so that is what ships.
+#define GAUGE_MEDIAN_N 32
+
+// A monotone gauge can never correct itself, so one escape hatch: a gap this large is a real step
+// change (charger attached, or a dip that latched), not noise. The filtered value moves by about a
+// point at a time, so nothing this size arrives by accident.
+#define GAUGE_RESYNC_PTS 10
+
+static uint16_t s2[GAUGE_MEDIAN_N];
+static uint8_t s2_next, s2_fill;
+
+// 0 / INT16_MIN / 0xFF all mean "not established yet" for their respective fields.
+static uint16_t smoothed_mv = 0;
+static int16_t load_sag_mv = INT16_MIN;
+static uint8_t reported_pct = 0xFF;
+
 void battery_note_boot_reading(uint16_t mv)
 {
     boot_mv = mv;
+}
+
+void battery_note_smoothed_reading(uint16_t mv)
+{
+    // Freeze the sag on the first settled mean, before mv is folded into the median below.
+    // Recomputing it later would turn it into "how far has the cell discharged since boot", which
+    // looks like a measurement and is not one -- it read 13 mV, then 46 mV, off the same boot as
+    // the cell drained away underneath it.
+    if (load_sag_mv == INT16_MIN && boot_mv != 0) {
+        load_sag_mv = (int16_t) ((int32_t) boot_mv - (int32_t) mv);
+    }
+
+    s2[s2_next] = mv;
+    s2_next = (uint8_t) ((s2_next + 1) % GAUGE_MEDIAN_N);
+    if (s2_fill < GAUGE_MEDIAN_N) {
+        s2_fill++; // a partial window still gives a usable median, so report from the first sample
+    }
+
+    // Insertion sort over at most 32 entries, once per guard decision. Cheaper to write than to
+    // justify anything cleverer.
+    uint16_t sorted[GAUGE_MEDIAN_N];
+    for (uint8_t i = 0; i < s2_fill; i++) {
+        uint16_t v = s2[i];
+        int8_t j = (int8_t) (i - 1);
+        while (j >= 0 && sorted[j] > v) {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+        sorted[j + 1] = v;
+    }
+    smoothed_mv = sorted[s2_fill / 2];
+}
+
+int battery_get_reported_percentage(uint8_t *battery_percentage)
+{
+    uint16_t mv = smoothed_mv;
+
+    if (mv == 0) {
+        // Before the guard's first decision there is nothing smoothed to use. One read is worse
+        // than a median of thirty-two, but it beats reporting nothing for the first 80 s of a boot.
+        int ret = battery_get_millivolt(&mv);
+        if (ret != 0 || mv == 0) {
+            return ret != 0 ? ret : -ENODATA;
+        }
+    }
+
+    uint8_t pct = 0;
+    int ret = battery_get_percentage(&pct, mv);
+    if (ret != 0) {
+        return ret;
+    }
+
+    // Monotone in the direction the cell is actually going. This is what guarantees the reported
+    // figure never walks back on itself; smoothing alone only makes it rarer, which still leaves a
+    // user watching 38, 42, 38. Erring a point low on a discharging cell is the safe direction.
+    bool charging = (battery_is_charging() == 1);
+    int diff = (int) pct - (int) reported_pct;
+
+    if (reported_pct == 0xFF || (diff >= GAUGE_RESYNC_PTS || diff <= -GAUGE_RESYNC_PTS)) {
+        reported_pct = pct;
+    } else if (charging) {
+        if (pct > reported_pct) {
+            reported_pct = pct;
+        }
+    } else if (pct < reported_pct) {
+        reported_pct = pct;
+    }
+
+    *battery_percentage = reported_pct;
+    return 0;
 }
 
 int battery_get_diagnostics(struct battery_diag *diag)
@@ -304,6 +404,8 @@ int battery_get_diagnostics(struct battery_diag *diag)
     diag->gpio_err = gpio_err;
     diag->charging = (uint8_t) (battery_is_charging() == 1);
     diag->boot_mv = boot_mv;
+    diag->smoothed_mv = smoothed_mv;
+    diag->load_sag_mv = load_sag_mv;
     // Read both registers back from the hardware rather than trusting that the write happened.
     // OUT alone is not enough: it reads 0 on a pin that was never made an output, which looks
     // identical to a pin correctly driven low while the divider is actually switched off.

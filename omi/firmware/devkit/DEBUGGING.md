@@ -590,6 +590,10 @@ counting through 5, 2, 1.** The same fit shows it also read *low* through the mi
 discharge — 50% reported at 3,756 mV where about 75% of the runtime actually remained — with the
 two curves crossing near 20%.
 
+The logs behind every figure in this trap, and the scripts that regenerate them, are in
+`scripts/devkit/measurements/` — start with its README. A number here that those scripts cannot
+reproduce should be treated as suspect.
+
 `battery_states[]` has since been **rebuilt from those 1,333 samples**, expressed as percent of
 runtime remaining (the load is constant, so charge burned tracks elapsed time) with 0% placed at the
 observed 3,400 mV cutoff instead of a nominal 3,000 mV empty. The reading now falls to zero at about
@@ -863,8 +867,73 @@ being a ring, which is after every test short enough to be convenient. And a bug
 invisible from outside: the guard sampled on schedule, logged plausible voltages, and computed an
 average that was arithmetically correct for the contents of the array. Only the contents were wrong.
 Nothing in a hardware smoke test distinguishes it from a working guard; a 30-line host simulation of
-the index arithmetic does so instantly. There is no firmware test lane in this tree to keep that
-simulation honest, which is the real gap this trap exposes.
+the index arithmetic does so instantly. That simulation is kept at
+`scripts/devkit/measurements/guard_window_sim.c` and produced the table above, but **nothing runs
+it** — it replicates the algorithm rather than executing the firmware's own code, so it cannot fail
+when `main.c` changes. Covering this properly means extracting the ring index behind a seam both the
+firmware and a host test compile, then registering it in `.github/checks-manifest.yaml`. Until then
+this bug class is uncovered, which is the real gap this trap exposes.
+
+### 21. A gauge that publishes a raw ADC read publishes its noise
+
+The percentage over BLE swung 38 → 42 → 38 on a cell that was doing nothing. Nothing was wrong with
+the battery, the divider or the curve: `broadcast_battery_level()` took **one** ADC read and
+converted it, every 15 s.
+
+One read carries about ±40 mV — 54 mV of spread across 12 consecutive samples on a stationary cell,
+which is what you would expect from a 338 kΩ source into a SAADC. The rebuilt `battery_states[]`
+reaches **0.24 %/mV** around 3,600 mV, so that jitter is worth ±10 percentage points on its own.
+Sampled live on hardware, 14 reads 12 s apart while the cell moved 9 mV:
+
+```
+  raw single read    3,674 .. 3,760 mV   ->  52% .. 65%     (13 points, cell not moving)
+  reported           3,708 .. 3,717 mV   ->  58% .. 59%     (one step, upward)
+```
+
+**The fix is two stages, and the first one alone is not enough.** Stage one reuses the mean
+`battery_guard()` already computes — 8 reads at 10 s — which also means the yellow low-battery LED
+and the reported percentage finally derive from the same samples instead of two independent reads
+that could disagree. Stage two is a median over 32 of those means, then a **monotone hold**: the
+figure may only fall while discharging and only rise while charging.
+
+The guard's own window deliberately stays at 8. Its length also sets how long the shutdown takes to
+react, so the gauge's extra smoothing had to go somewhere else.
+
+Both constants were measured rather than chosen.
+[`measurements/gauge_smoothing_sim.c`](../scripts/devkit/measurements/gauge_smoothing_sim.c) replays
+this exact path against a cell draining at the measured 19 mV/h with the measured jitter, and counts
+**direction reversals** in the published series — every reversal being a number a user watched jump
+and come back:
+
+```
+  single read (as shipped)      2457 reversals   worst error 10 pts
+  guard mean alone              1174                          6
+  guard mean + hysteresis        361                          6     <- first attempt, discarded
+  median of 16 + monotone           0                          3
+  median of 32 + monotone           0                          3     <- ships; final value exact
+```
+
+Two things worth keeping. **Smoothing reduces flapping; only monotonicity removes it.** The first
+attempt was a plain hysteresis band on the guard's mean, which felt sufficient and still reversed
+361 times — a directional ratchet on a noisy signal tracks the noise floor rather than the mean. It
+was written, simulated and thrown away before reaching hardware, which took about five minutes.
+
+And **reversals alone are the wrong thing to optimise**, because a gauge that refuses to move scores
+zero. The simulation reports worst deviation from truth alongside, which is what rules out the
+degenerate answer; monotone-plus-median holds at 3 points and lands the final reading exactly on the
+truth. It errs slightly low as the cell drains, which is the safe direction for a battery display.
+
+A monotone figure can never correct itself, so there is one escape hatch: a gap of 10 points or more
+is taken as a real step change rather than noise, since the filtered value moves about a point at a
+time. Nothing safety-critical consumes any of this — `battery_guard()` and `battery_boot_gate()`
+both decide in millivolts — so the blast radius is display accuracy.
+
+The same commit fixed a smaller lie next door. **`load sag` was recomputed on every read**, so it
+drifted as the cell drained — 13 mV, then 46 mV, off one boot — presenting "how much has discharged
+since boot" as a load measurement. It is now frozen at the first settled mean, which is the moment
+the radio, mic and card are all up. `battery_get_diagnostics()` reports both the smoothed voltage
+and the frozen sag as payload version 7; `battery.py` prints the raw read against the mean, so the
+jitter above stays visible rather than being hidden by the thing that fixed it.
 
 ## Measured Baselines
 

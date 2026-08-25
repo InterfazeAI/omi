@@ -267,6 +267,10 @@ static void battery_guard(void)
     }
     uint16_t avg = (uint16_t) (sum / BATT_WINDOW);
 
+    // Published before the charging check below, so the reported percentage keeps tracking a cell
+    // that is on the charger. Only the shutdown logic wants to stand down while charging.
+    battery_note_smoothed_reading(avg);
+
     if (battery_is_charging() == 1) {
         strikes = 0;
         battery_low = false;

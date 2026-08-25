@@ -32,15 +32,23 @@ def show(diag, level):
     print(f"  divider       P0.14 {'LOW - enabled' if diag.divider_enabled else 'HIGH - DISABLED'}"
           f"{'' if diag.enable_is_output else ', NOT AN OUTPUT'}")
 
-    # The boot gate samples before the radio, mic and card start, so the difference against the
-    # running voltage is the load sag -- the figure the gate's threshold has to clear. It only
-    # appears on a boot that ran on battery, because charging skips the gate entirely.
+    # The reported percentage is built on the smoothed mean, not on the fresh read above. Showing
+    # both is the point: their difference is the jitter the gauge used to publish directly.
+    if diag.smoothed_mv:
+        jitter = diag.jitter_mv
+        print(f"  smoothed      {diag.smoothed_mv:,} mV   "
+              f"(this read is {jitter:+,} mV off the mean)")
+    else:
+        print("  smoothed      not yet -- the guard's window fills ~80 s after boot")
+
+    # Frozen at the first settled mean, so it stays a load measurement instead of drifting into
+    # "how far has the cell discharged since boot". Only exists on a boot that ran on battery,
+    # because charging skips the gate that takes the rested reading.
     sag = diag.load_sag_mv
     if sag is None:
         print("  load sag      not measured this boot (gate skipped: charging, or older firmware)")
     else:
-        print(f"  load sag      {sag:,} mV   ({diag.boot_mv:,} mV at boot -> "
-              f"{diag.battery_mv:,} mV running)")
+        print(f"  load sag      {sag:,} mV   ({diag.boot_mv:,} mV at boot, rested)")
 
     errors = {"init": diag.init_err, "adc setup": diag.setup_err,
               "gpio": diag.gpio_err, "adc read": diag.read_err, "call": diag.call_err}

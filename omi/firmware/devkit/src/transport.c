@@ -398,7 +398,7 @@ static struct bt_uuid_128 diagnostics_service_uuid =
 static struct bt_uuid_128 battery_diag_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10051, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 
-#define BATTERY_DIAG_BYTES 28
+#define BATTERY_DIAG_BYTES 32
 
 static ssize_t battery_diag_read_handler(struct bt_conn *conn,
                                          const struct bt_gatt_attr *attr,
@@ -411,7 +411,7 @@ static ssize_t battery_diag_read_handler(struct bt_conn *conn,
 
     int err = battery_get_diagnostics(&diag);
 
-    out[0] = 6; // layout version
+    out[0] = 7; // layout version
     out[1] = diag.read_enable;
     sys_put_le16((uint16_t) diag.raw_counts, &out[2]);
     sys_put_le32((uint32_t) diag.adc_mv, &out[4]);
@@ -426,10 +426,13 @@ static ssize_t battery_diag_read_handler(struct bt_conn *conn,
     out[20] = diag.enable_is_output;
     out[21] = diag.charging;
     sys_put_le32((uint32_t) diag.vdd_mv, &out[22]);
-    // What the boot gate measured before the radio, mic and card came up. Read against battery_mv
-    // above, on the same charge, this is the load sag the gate's threshold is supposed to allow
-    // for -- currently the one number in that calculation that was assumed rather than measured.
+    // What the boot gate measured before the radio, mic and card came up.
     sys_put_le16(diag.boot_mv, &out[26]);
+    // The guard's rolling mean, and the load sag frozen at the first settled mean. battery_mv above
+    // is still a fresh single read on purpose -- comparing the two is how the jitter is visible at
+    // all, and a smoothed-only view would hide a gauge that had started reading nonsense.
+    sys_put_le16(diag.smoothed_mv, &out[28]);
+    sys_put_le16((uint16_t) diag.load_sag_mv, &out[30]);
 
     return bt_gatt_attr_read(conn, attr, buf, len, offset, out, sizeof(out));
 }
@@ -709,10 +712,13 @@ void broadcast_battery_level(struct k_work *work_item)
 {
     uint16_t battery_millivolt;
     uint8_t battery_percentage;
-    if (battery_get_millivolt(&battery_millivolt) == 0 &&
-        battery_get_percentage(&battery_percentage, battery_millivolt) == 0) {
+    // Deliberately not battery_get_percentage() on a fresh read. That is one ADC sample carrying
+    // about +/-40 mV of jitter, converted on a curve that reaches 0.24 %/mV, published every 15 s:
+    // a stationary cell reported 38%, then 42%, then 38% again. The reported figure now comes from
+    // the guard's rolling mean with hysteresis on top.
+    if (battery_get_millivolt(&battery_millivolt) == 0 && battery_get_reported_percentage(&battery_percentage) == 0) {
 
-        LOG_PRINTK("Battery at %d mV (capacity %d%%)\n", battery_millivolt, battery_percentage);
+        LOG_PRINTK("Battery at %d mV raw (reported %d%%)\n", battery_millivolt, battery_percentage);
 
         // Use the Zephyr BAS function to set (and notify) the battery level
         int err = bt_bas_set_battery_level(battery_percentage);

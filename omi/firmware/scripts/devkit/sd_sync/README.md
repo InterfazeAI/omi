@@ -107,6 +107,9 @@ shield and written off as unrepairable. It was the BAT+ wiring. Note that the bo
 battery does not rule this out, because it can be powered through a route that never touches the
 BAT+ pad the divider taps. See `devkit/DEBUGGING.md` trap 14.
 
+The drain logs behind the numbers below, and the scripts that regenerate them, live in
+[`../measurements/`](../measurements/README.md).
+
 **Expect roughly 40 hours** on a full charge while recording continuously with BLE advertising.
 Do not estimate it from a short `--watch` run near full: the cell drops about 26 mV/h between
 4.0 and 3.8 V but only 12 mV/h across the long 3.8–3.5 V plateau, so a couple of hours of samples
@@ -123,10 +126,33 @@ roughly 10% and the board then stopped. It also read *low* through the middle, r
 3,756 mV where about three quarters of the runtime remained. Both are fixed. It is still one cell
 at one temperature, so treat it as a good guide rather than a fuel gauge.
 
-`battery.py` also prints a **load sag** line — the difference between the voltage sampled at boot,
-before the radio, mic and card start, and the voltage now. That is the margin the low-battery boot
-gate is sized against, and it measured **22 mV** (3,853 → 3,831 mV) against a 50 mV margin. Expect
-more than that on a nearly flat cell, where internal resistance is higher. It reads
+### reported vs computed
+
+`battery.py` prints two percentages, and the difference between them is the point.
+
+`computed` is a fresh single ADC read converted on the spot — the noisy view. `reported` is what the
+Battery Service actually publishes: a median over the low-battery guard's recent rolling means, held
+monotone so it can only fall while discharging and rise while charging. `smoothed` shows the voltage
+behind it, with the raw read's offset from it.
+
+Sampled 12 s apart on a cell that moved 9 mV:
+
+```
+  computed    3,674 .. 3,760 mV  ->  52% .. 65%     13 points of nothing
+  reported    3,708 .. 3,717 mV  ->  58% .. 59%     one step, upward
+```
+
+So a jumpy `computed` next to a steady `reported` is the tools working, not a fault. The gauge used
+to publish `computed` directly, which is why the level flapped 38 → 42 → 38 between one-minute
+polls. `reported` lags by up to 3 points and errs slightly low while draining, which is deliberate.
+Full reasoning in `devkit/DEBUGGING.md` trap 21.
+
+`battery.py` also prints a **load sag** line: the rested voltage the boot gate sampled, before the
+radio, mic and card start, against the first settled reading once everything is up. That is the
+margin the low-battery boot gate is sized against, and it measured **22 mV** (3,853 → 3,831 mV)
+against a 50 mV margin. Expect more on a nearly flat cell, where internal resistance is higher. It
+is captured once per boot and frozen — it used to be recomputed on every read, which quietly turned
+it into "how much has discharged since boot" (13 mV, then 46 mV, off one boot). It reads
 `not measured this boot` on USB, since charging skips the gate; unplug and reset to get a number.
 
 **If the board seems dead after a flat battery, watch the LED before assuming the worst.** Three
